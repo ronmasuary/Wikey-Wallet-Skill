@@ -1,0 +1,653 @@
+---
+name: wikey-wallet-skill
+description: >
+  Complete operational guide for interacting with the Omnistar blockchain via
+  the Secure Signing Process (SSP) in agent-child mode. Use this skill whenever
+  the task involves: spawning the SSP signing server, managing blockchain keys
+  or safes on Omnistar, signing or broadcasting transactions via wallet-cli,
+  computing HMAC proofs with ssp-util, querying profiles/balances/assets,
+  creating or editing policies, voting, recovering accounts, or handling any
+  wallet-cli command. Also use this skill when the user asks to install the SSP
+  agent-child binaries. Trigger on any mention of: SSP, signing-server,
+  ssp-util, wallet-cli, Omnistar, omnistar1..., safe, policy, HMAC proof,
+  agent-child mode, or Wikey.
+---
+
+# SSP Agent-Child Mode — Operational Guide
+
+This document is the complete reference for operating the Omnistar blockchain
+via the Secure Signing Process (SSP) in **agent-child mode**: the agent spawns
+SSP, holds the HMAC key in memory, and drives all chain operations exclusively
+through `wallet-cli` and `ssp-util`.
+
+---
+
+## Installation
+
+The installer script is bundled at `assets/install-child-mode.js` (relative to
+this SKILL.md). Run it with Node.js 22+:
+
+```bash
+node assets/install-child-mode.js
+```
+
+Environment overrides (all optional):
+
+| Variable        | Default        | Purpose                              |
+|----------------|----------------|--------------------------------------|
+| `SSP_VERSION`  | `latest`       | Pin a specific release tag           |
+| `SSP_INSTALL_DIR` | `~/.ssp`    | Where binaries are installed         |
+| `SSP_CLOUD`    | unset          | Set to `1` for cloud KMS variant     |
+| `SSP_BASE_URL` | GitLab registry| Override artifact download base URL  |
+
+Installs: `signing-server`, `ssp-util` (to `~/.ssp/bin`), and `wallet-cli`
+(globally via npm). Adds `~/.ssp/bin` to PATH in `.bashrc`/`.zshrc`.
+
+---
+
+## Operating Rules — Read Before Any Action
+
+**Only two tools may interact with SSP and the chain:**
+1. `wallet-cli ...` — all blockchain operations (queries, key creation, transactions, broadcasts).
+2. `ssp-util proof ...` — HMAC proof computation only.
+
+**Never:**
+- Call SSP HTTP endpoints (`/v1/sign`, `/v1/keys`, `/v1/metadata`, etc.) directly via `curl`, `fetch`, `requests`, or any HTTP client.
+- Implement HMAC-SHA256 yourself — always shell out to `ssp-util proof`.
+- Log, write, persist, or transmit the value of `SSP_HMAC_KEY`.
+- Modify, patch, recompile, or replace `wallet-cli` or `ssp-util` in any way (including edits to `node_modules/`, runtime shims, or forked binaries). These are externally-released packages; local changes are invisible to others, get wiped on reinstall, and paper over real problems.
+- **Use `shell_exec` for any `wallet-cli` command.** Almost every `wallet-cli` command issues interactive stdin prompts (policy selections, names, confirmations, `Enter proof:`). `shell_exec` cannot respond to prompts — it will hang until killed. Use the Node.js driver (see "Signing Transactions") for every `wallet-cli` invocation, passing all expected stdin lines upfront via `stdin_inputs`.
+
+### When `wallet-cli` appears broken
+
+Treat the tool as **read-only**. Never edit it to fix a symptom. In order:
+
+1. **Read the error.** `wallet-cli` writes structured JSON errors to stdout on non-zero exit; quote `error.message` back to the user.
+2. **Check inputs.** Wrong address, missing `--broadcast`, wrong asset units (see smallCoin rule), stale `--signature`, `--name` used as a CLI flag instead of stdin, etc.
+3. **Check versions.** Run `wallet-cli --version` and `signing-server --version`. Version drift is a known failure class — report it and stop.
+4. **Check the chain.** RPC reachable? Account funded? Safe validated yet (~30s after broadcast)?
+5. **Stop and report.** Surface the exact command, exact error, and what was already checked — then ask the user.
+
+---
+
+## Architecture
+
+```
+Agent generates random 32-byte HMAC key
+  └── sets SSP_HMAC_KEY=<key> in child process environment only
+       └── spawns: signing-server -spawned-by-agent -keystore secure [flags]
+            └── SSP reads + clears SSP_HMAC_KEY from env
+                 └── SSP enforces HMAC proof on every signing call
+                      └── wallet-cli makes those calls; agent drives wallet-cli
+```
+
+The agent holds the HMAC key. Responsibilities:
+1. Keep the key in memory — never log, write, or print it.
+2. Produce a valid HMAC proof **only via `ssp-util proof`** when `wallet-cli` requests one.
+3. Erase the key from memory when the session ends.
+
+### Session Startup — Signing Server
+
+**On every session start** (first task after boot or restart):
+
+1. Kill any existing signing-server: `pkill -f 'signing-server.*-spawned-by-agent'`
+2. Generate a fresh HMAC key in memory (Node.js: `crypto.randomBytes(32).toString('hex')`)
+3. Spawn signing-server with that key in `SSP_HMAC_KEY` env (see Spawning SSP)
+4. Hold the key in memory for the rest of the session
+
+**The nonce file is NOT lost on respawn** — it persists on disk at `<workspace>/.ssp-nonce`. Only the HMAC key is regenerated. Always use a consistent `--nonce-file` path so nonce state survives server restarts.
+
+---
+
+## Spawning SSP
+
+Generate a cryptographically random 32-byte key and set it **only in the child
+process environment** — not in the agent's own environment. Always use
+`-keystore secure`; production binaries refuse `memory` and `fs`.
+
+**Node.js:**
+```js
+const key = require('crypto').randomBytes(32).toString('hex');
+const child = spawn('signing-server', ['-spawned-by-agent', '-keystore', 'secure'], {
+  env: { ...process.env, SSP_HMAC_KEY: key }
+});
+```
+
+**Python:**
+```python
+import os, subprocess
+key = os.urandom(32).hex()
+proc = subprocess.Popen(
+  ['signing-server', '-spawned-by-agent', '-keystore', 'secure'],
+  env={**os.environ, 'SSP_HMAC_KEY': key}
+)
+```
+
+**Go:**
+```go
+key := make([]byte, 32); rand.Read(key)
+keyHex := hex.EncodeToString(key)
+cmd := exec.Command("signing-server", "-spawned-by-agent", "-keystore", "secure")
+cmd.Env = append(os.Environ(), "SSP_HMAC_KEY="+keyHex)
+```
+
+---
+
+## Startup Checklist
+
+Run these on first wake-up to orient:
+
+```bash
+wallet-cli config show        # Who am I? (address, pubkey, RPC endpoint)
+wallet-cli query profile      # My on-chain profile: address, pubkey, policies, linked safes
+wallet-cli query balances --address <MY_ADDR>  # OST gas balance on my profile address
+```
+
+If `config show` shows an empty address: create a key (see Key Management), share the address with the user, wait for OST funding, then run `tx create-safe` to create your profile and safe on-chain.
+
+---
+
+## Key Concepts
+
+### Profile vs. Safe
+
+Both profile and safe are on-chain safe constructs. The difference is their role.
+
+| | Profile | Safe |
+|---|---|---|
+| What it is | The key's identity safe on-chain | An asset-holding safe the key operates on behalf of |
+| What it holds | Address, pubkey, policies, list of linked safes | Asset balances (BTC/ETH/OST/…), policies, authorized signers |
+| How created | Created together with the safe via `tx create-safe` | Created via `tx create-safe` |
+| How to query | `wallet-cli query profile` | `wallet-cli query snapshot --address SAFE_ADDR` |
+
+When you want to know **"what can I do / what safes do I control?"** → query the profile.
+When you want to know **"what does this safe hold / what policies govern it?"** → query the safe.
+
+### `SIGNATURE` vs. target-chain `transfer_id`
+
+When any command is broadcast to Omnistar, the result is an **Omnistar tx hash**. This hash is stored on every on-chain object as its `SIGNATURE` field, and is what `--signature` flags consume.
+
+Do **not** confuse this with a **target-chain transfer id** (Bitcoin txid, Ethereum tx hash, Solana signature). That id tracks the external transfer in its own chain's explorer and is never passed back to `wallet-cli`.
+
+| What | Source | Used for |
+|---|---|---|
+| `SIGNATURE` on a snapshot object | Omnistar broadcast result | `--signature` flag on `tx ...` commands |
+| Target-chain `transfer_id` | BTC/ETH/SOL/etc. after the safe's transfer executes | Lookup in the target chain's explorer only |
+
+---
+
+## Golden Rules
+
+1. **Never use `--name` or `--description` flags** on `tx create-policy` or `tx edit-policy`. They break JSON encoding. Feed name/description via stdin instead.
+2. **Blockchain deletes are soft-deletes only.** Data stays on-chain. Think before broadcasting.
+3. **Always `--broadcast` to finalize.** Without it, nothing hits the chain.
+4. **Profile address needs OST for every on-chain action.** `ACCOUNT_NOT_FOUND` means the address has never received tokens — the on-chain account doesn't exist yet. Share the address with the user, wait for OST, then proceed.
+5. **Resolve usernames before use.** Use the API to convert a username to an address (see Username Resolution).
+
+---
+
+## Signing Transactions
+
+All signing and broadcasting goes through `wallet-cli`. When `wallet-cli`
+reaches its `Enter proof:` prompt, compute the proof with `ssp-util proof` and
+write the result to `wallet-cli`'s stdin.
+
+### How the proof flow works
+
+- `wallet-cli` emits the sign request to **stderr** in this shape:
+  ```
+  Sign Request:
+  {"requestId":"...","unsignedData":"<hex>","signingPubKey":"<hex>","proof":null}
+
+  Enter proof:
+  ```
+- Parse that JSON, extract `unsignedData` and `signingPubKey` (both hex).
+- Run `ssp-util proof`, **piping the 64-hex HMAC key via stdin** (never as a CLI argument):
+  ```bash
+  echo "<64-hex-key>" | ssp-util proof \
+    --unsigned-data <hex-encoded-unsigned-transaction> \
+    --signing-pub-key <hex-encoded-compressed-pubkey-33-bytes> \
+    --nonce-file <workspace>/.ssp-nonce
+  ```
+- Output: `{"nonce": N, "hmac": "<base64-encoded-hmac>"}` — write this **as-is** to `wallet-cli`'s stdin followed by `\n`, then close stdin. Do not re-encode.
+- The signed transaction prints on `wallet-cli`'s **stdout**. On non-zero exit, a JSON error on stdout carries `error.message`.
+- If the invocation has neither `--sign` nor `--broadcast`, append `--sign`.
+
+No gas/fee input is needed — `wallet-cli` simulates and computes fees itself.
+
+### Minimal Node.js driver
+
+Use this driver for **every** `wallet-cli` command — not just signing. Pass all
+expected interactive answers as `stdin_inputs` (array of strings). For commands
+with no interactive prompts and no signing, pass an empty array and omit
+`--sign`/`--broadcast`.
+
+```js
+// driver.mjs — drives one wallet-cli invocation end-to-end.
+// Usage: SSP_HMAC_KEY=<64-hex> node driver.mjs tx create-safe --username my-safe --broadcast
+// stdin_inputs: pre-feed answers to interactive prompts that appear BEFORE "Enter proof:"
+import { spawn } from "node:child_process";
+
+const HMAC_KEY = process.env.SSP_HMAC_KEY;
+const NONCE_FILE = process.env.SSP_NONCE_FILE || `${process.cwd()}/.ssp-nonce`;
+const args = process.argv.slice(2);
+if (!args.includes("--sign") && !args.includes("--broadcast")) args.push("--sign");
+
+function parseSignRequest(buf) {
+  const i = buf.indexOf("Sign Request:");
+  if (i === -1) return null;
+  const tail = buf.slice(i + "Sign Request:".length);
+  const start = tail.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0, end = -1;
+  for (let k = start; k < tail.length; k++) {
+    if (tail[k] === "{") depth++;
+    else if (tail[k] === "}" && --depth === 0) { end = k; break; }
+  }
+  if (end === -1) return null;
+  try {
+    const obj = JSON.parse(tail.slice(start, end + 1));
+    if (obj.unsignedData && obj.signingPubKey) return obj;
+  } catch {}
+  return null;
+}
+
+function computeProof({ unsignedData, signingPubKey }) {
+  return new Promise((resolve, reject) => {
+    const p = spawn("ssp-util", ["proof",
+      "--unsigned-data", unsignedData,
+      "--signing-pub-key", signingPubKey,
+      "--nonce-file", NONCE_FILE]);
+    let out = "", err = "";
+    p.stdout.on("data", c => out += c);
+    p.stderr.on("data", c => err += c);
+    p.on("close", code => code === 0
+      ? resolve(out.trim())
+      : reject(new Error(`ssp-util exit ${code}: ${err}`)));
+    p.stdin.end(HMAC_KEY + "\n");   // key on stdin, never argv
+  });
+}
+
+const child = spawn("wallet-cli", args, { stdio: ["pipe", "pipe", "pipe"] });
+let stderrBuf = "", stdout = "", proofSent = false;
+
+child.stderr.on("data", async chunk => {
+  stderrBuf += chunk;
+  if (proofSent) return;
+  const req = parseSignRequest(stderrBuf);
+  if (!req) return;
+  proofSent = true;
+  const proof = await computeProof(req);
+  child.stdin.write(proof + "\n");
+  child.stdin.end();
+});
+child.stdout.on("data", c => stdout += c);
+child.on("close", code => {
+  if (code === 0) { process.stdout.write(stdout); return; }
+  let detail = stderrBuf.slice(-500);
+  try {
+    const j = JSON.parse(stdout.trim());
+    detail = j?.error?.message ?? j?.message ?? detail;
+  } catch {}
+  console.error(`wallet-cli exit ${code}: ${detail}`);
+  process.exit(code);
+});
+```
+
+> For flows that also need to answer interactive prompts (`Enter policy name`,
+> `Your selection`, `Enter threshold`, ...) **before** reaching `Enter proof:`,
+> extend the driver with throttled stdin feeding and a hard timeout. The
+> canonical reference is `openclaw/src/tools/ssp-sign.ts`.
+
+---
+
+## Interactive Commands — stdin_inputs
+
+`tx create-policy` and `tx edit-policy` are interactive (readline prompts).
+Pass inputs as newline-separated strings via stdin. **Never use `--name` or
+`--description` as CLI flags.**
+
+### `tx create-policy --apply-on profile`
+
+| Prompt | Answer |
+|---|---|
+| `Your selection:` | `2` (Allow Update User Address) or `1` (Voting) |
+| `Enter allowed source addresses (comma-separated):` | address(es) or empty |
+| `Enter threshold percentage (0-100):` | e.g. `100` |
+| `Enter policy name (optional, press Enter to skip):` | name or empty |
+| `Enter policy description (optional, press Enter to skip):` | description or empty |
+
+### `tx create-policy --apply-on transaction`
+
+| Prompt | Answer |
+|---|---|
+| `Your selection:` | `1` (Voting) |
+| `Enter voting quantity (percentage, 0-100):` | e.g. `100` |
+
+### `tx edit-policy` — same prompt order as `create-policy`.
+
+---
+
+## Key Management
+
+The keypair is generated inside the signing-server and stored in its keystore. The private key never leaves the signing-server — `wallet-cli` only receives the public key and derived address.
+
+```bash
+wallet-cli keys create --set-default    # Generate keypair in signing-server, set as default
+wallet-cli keys list                    # List all key IDs
+wallet-cli keys get --id <keyId>        # Get key details
+```
+
+**Onboarding flow:**
+1. `wallet-cli keys create --set-default` — keypair created, address returned
+2. Share address with user, wait for OST funding
+3. `tx create-safe --username NAME --broadcast` — creates both profile and safe on-chain
+4. Profile address must maintain OST balance — every subsequent on-chain action costs fees
+
+---
+
+## Account Recovery
+
+Recovery replaces a lost key with a new one. The account username and linked safes carry over — only the signing key changes.
+
+### Helpers
+
+Helpers are trusted addresses designated to approve recovery. They have **no signing authority over the safe, no access to funds, and no governance role**. Do not ask about permissions or roles when managing helpers — there are none. Use `tx edit-helpers` directly.
+
+When recovery is requested, each helper receives a deeplink. Once enough helpers run `tx approve-recovery` to meet the threshold, the chain accepts the new key as the account owner.
+
+### Threshold
+
+The threshold is how many helpers must approve before recovery succeeds.
+
+**Input to CLI:** integer `1–N` (count of helpers required).
+**In snapshot:** displayed as percentage (e.g. 2 of 3 helpers → `67%`). Never feed the percentage value as CLI input.
+
+| Threshold | Risk |
+|---|---|
+| 100% (all helpers) | One helper unavailable → recovery blocked forever |
+| 1 (any single helper) | One compromised helper → attacker steals account |
+| Majority (e.g. 2 of 3) | Tolerates one lost helper, requires collusion to attack |
+
+Rule: **never set to 100%**. Recommended: majority. Example: 3 helpers → threshold `2`.
+
+### Secured Profile
+
+A profile is secured when helpers cannot easily collude and the threshold tolerates loss:
+
+1. **3+ helpers minimum**
+2. **Unrelated to each other** — family, old colleagues, friends from different contexts. Helpers who know each other can collude and steal the account
+3. **Threshold = majority, not all** — losing one helper still allows recovery
+4. **Threshold > 1** — a single compromised helper cannot hijack the account alone
+
+**Weak (avoid):**
+- 1 helper, threshold 1 → single point of failure and attack
+- All helpers from same organization → collusion risk
+- Threshold 100% → one unavailable helper = permanent lockout
+
+**Strong example:**
+```
+3 helpers: family member, old colleague, close friend
+Threshold: 2
+```
+
+### Self-Recovery (Agent Lost Its Own Key)
+
+If the agent's signing key is lost (SSP keystore wiped, machine replaced, etc.):
+
+```
+1. wallet-cli keys create --set-default
+   → new keypair generated inside signing-server
+   → new omnistar1... address
+
+2. Share new address with user — wait for OST funding (gas required)
+
+3. wallet-cli tx request-recovery --broadcast
+   → signs with NEW key
+   → references ORIGINAL account username (the one being recovered)
+   → agent surfaces deeplink to each helper
+
+4. Each helper runs:
+   wallet-cli tx approve-recovery --oldaccount ORIGINAL_USERNAME --newaccount NEW_ADDR --broadcast
+
+5. Threshold met → new key owns old account and all linked safes
+```
+
+The original username is the account name the agent had before key loss — not the new address's username.
+
+---
+
+## Configuration
+
+```bash
+wallet-cli config show                           # View full config
+wallet-cli config get user.address               # Get address
+wallet-cli config set user.address omnistar1...  # Set address
+wallet-cli config set user.pubkey BASE64PUB      # Set pubkey (base64)
+```
+
+---
+
+## Queries
+
+```bash
+wallet-cli query snapshot                         # Full safe snapshot (uses config address)
+wallet-cli query snapshot --address omnistar1...  # Snapshot for a specific address
+wallet-cli query profile  --address omnistar1...  # Profile: policies, users, groups, SIGNATUREs
+wallet-cli query balances --address omnistar1...  # OST balance held directly by this address
+wallet-cli query assets                           # Full asset portfolio of the safe (OST + all cross-chain assets)
+wallet-cli query account  --address omnistar1...  # Account number, sequence
+wallet-cli query chain-info                       # Chain ID, latest block height
+```
+
+### `balances` vs `assets`
+
+- `query balances` — OST balance of the given address. Profile-focused: use to check gas/funding. Requires `--address`. OST held by a safe must be sent via `tx create-transaction`, not `tx send`.
+- `query assets` — full asset portfolio of the safe (OST + BTC/ETH/SOL/ERC20s/…) with smallCoin, explorer link, and pair value per asset. Defaults to the configured safe — no `--address` needed.
+
+### smallCoin — convert before transferring
+
+`query assets` returns balances in **display units** (e.g. `1.5` USDC). The on-chain unit (`--amount` and `--small-coin` consume) is:
+
+```
+amount_in_smallest_units = balance × smallCoin
+# e.g. 1.5 × 1_000_000 = 1_500_000
+```
+
+Always do this multiplication explicitly. Passing the display value as `--amount` silently truncates and sends the wrong amount.
+
+**Getting policy SIGNATUREs:** `wallet-cli query profile --address ADDR` — find the policy by its `id`, then read its `SIGNATURE` field. Required for `edit-policy` and `delete-policy`.
+
+---
+
+## Transaction Commands Reference
+
+### `tx create-safe`
+```bash
+wallet-cli tx create-safe --username NAME --broadcast
+```
+Creates a safe with 9 initialization messages. Takes ~30s to validate on-chain after broadcast. Username rules: letters, numbers, dots only; no leading, trailing, or consecutive dots.
+
+### `tx send` — OST between key addresses (no safe)
+```bash
+wallet-cli tx send --from ADDR --to ADDR --amount 1000nost --broadcast
+```
+Plain Cosmos bank transfer of OST out of an address that directly holds it. No safe, no policy, no vote. For funding accounts or paying gas. **Sending funds out of a safe — including OST — is not `tx send`; use `tx create-transaction` instead.**
+
+### `tx create-policy`
+```bash
+wallet-cli tx create-policy --destination ADDR --apply-on profile --broadcast
+# stdin: "2\nALLOWED_ADDR\n100\nPolicy Name\nDescription\n"
+```
+
+### `tx edit-policy`
+```bash
+wallet-cli tx edit-policy --destination ADDR --policy-id POLICY_ID --signature SIG --apply-on profile --broadcast
+# stdin: "2\nALLOWED_ADDR\n100\nPolicy Name\nDescription\n"
+```
+
+### `tx delete-policy`
+```bash
+wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature SIG --broadcast
+```
+⚠️ Soft-delete only. Data remains on-chain.
+
+### `tx create-user`
+```bash
+wallet-cli tx create-user --destination SAFE_ADDR --public-key omnistar1... --broadcast
+```
+
+### `tx delete-user`
+```bash
+wallet-cli tx delete-user --destination SAFE_ADDR --user-id UUID --signature SIG --broadcast
+```
+
+### `tx vote`
+```bash
+wallet-cli tx vote --destination SAFE_ADDR --vote YES --signature SIG --broadcast
+```
+Vote values: `YES`, `NO`, `ABSTAIN`.
+
+### `tx create-transaction` — move assets out of a safe
+
+Use this — not `tx send` — whenever **the safe holds the funds**, regardless of asset type.
+
+```bash
+# Native token
+wallet-cli tx create-transaction --destination SAFE_ADDR --to RECIPIENT \
+  --amount 100000 --asset BTC --fee-priority high --broadcast
+
+# ERC20 token (all three extra flags required together)
+wallet-cli tx create-transaction --destination SAFE_ADDR --to 0xRecipient \
+  --amount 1500000 --asset USDC --fee-priority medium \
+  --token-address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
+  --chain ethereum --small-coin 1000000 --broadcast
+```
+
+ERC20 extra flags:
+
+| Flag | Description |
+|---|---|
+| `--token-address` | ERC20 contract address (0x + 40 hex) |
+| `--chain` | `ethereum`, `polygon`, or `base` |
+| `--small-coin` | Token smallest unit divisor |
+
+Use `wallet-cli query assets` to look up `contractAddress`, `smallCoin`, and `chain` from the `layer2data` field.
+
+### `tx request-recovery`
+```bash
+wallet-cli tx request-recovery --broadcast
+```
+Used for two scenarios:
+- **User lost their key** — agent drives recovery on behalf of the user
+- **Agent lost its own key** — agent recovers its own account (see Self-Recovery in Account Recovery section)
+
+In both cases, `tx request-recovery` is signed by the **new key**. The command references the **original account username** (the one being recovered), not the new address's username.
+
+After running, surface:
+
+1. **List of helpers** — each helper's address and on-chain username (if resolvable).
+2. **A single Wikey deeplink** to forward to every helper:
+   ```
+   https://open.wikey.io/accountRecover?t=recover&pk=<NEW_ADDRESS>&tn=<REQUESTER_USERNAME>
+   ```
+   - `NEW_ADDRESS` — the new address replacing the old one.
+   - `REQUESTER_USERNAME` — on-chain username of the account being recovered (not a helper's username).
+   - URL-encode values containing characters outside `[A-Za-z0-9._-]`.
+
+Output template:
+```
+Recovery requested for <REQUESTER_USERNAME> → <NEW_ADDRESS>
+
+Helpers to contact:
+  1. <addr1>  (<username1 or "—">)
+  2. <addr2>  (<username2 or "—">)
+
+Send this link to each helper:
+  https://open.wikey.io/accountRecover?t=recover&pk=<NEW_ADDRESS>&tn=<REQUESTER_USERNAME>
+```
+
+### `tx approve-recovery`
+```bash
+wallet-cli tx approve-recovery --oldaccount alice --newaccount omnistar1... --broadcast
+```
+Helper-side counterpart — used when this agent is a helper approving someone else's recovery.
+
+### `tx edit-helpers`
+```bash
+wallet-cli tx edit-helpers --broadcast
+# stdin: "y\nHELPER_ADDRESS\nn\nn\n2\n"
+```
+
+**Helpers are for account recovery only** — no safe permissions, no governance role. When asked to add a helper, run this command directly. Do not ask about roles.
+
+Prompt order:
+
+| Prompt | Answer |
+|---|---|
+| `Would you like to add a helper? (y/n):` | `y` or `n` |
+| `Enter helper address or username:` | address or username (repeated per helper) |
+| `Would you like to add another helper? (y/n):` | `y` or `n` |
+| `Would you like to remove a helper? (y/n):` | `y` or `n` |
+| `Enter the number of the helper to remove:` | number (if removing) |
+| `Would you like to remove another helper? (y/n):` | `y` or `n` |
+| `Enter threshold (number of helpers required, 1-N):` | integer count of helpers required (e.g. `2` for 2-of-3). Snapshot displays this as a percentage — never feed the percentage back as input. |
+
+---
+
+## Username Resolution
+
+```bash
+curl -s "https://reverse-proxy.omnistar.io/mainnet/proxy/users/accounts/getAccountByName/?accountName=USERNAME"
+# Returns: {"public_key": "omnistar1...", "display_name": "...", ...}
+```
+
+Always resolve usernames to addresses before using them in transactions.
+
+---
+
+## Nonce File
+
+The nonce file (`<workspace>/.ssp-nonce`) tracks the monotonically increasing
+nonce counter. It does **not** contain the HMAC key or any secret.
+
+**Delete it whenever SSP restarts.** Each new session generates a fresh HMAC
+key and the server's nonce resets to 0. `ssp-util` manages this file
+automatically — never write to it directly.
+
+---
+
+## External Endpoints
+
+SSP's own HTTP endpoints are intentionally omitted — `wallet-cli` is the only
+supported caller. The endpoints below are external read-only services.
+
+### Omnistar RPC
+- RPC: `http://prod-full-1.omnistar.io:26657`
+- LCD: `http://prod-full-1.omnistar.io:1317`
+- Proxy: `https://reverse-proxy.omnistar.io/mainnet/proxy`
+- Node API: `https://reverse-proxy.omnistar.io/mainnet/node`
+- API Key: `wallet-cli config get apiKey`
+
+### Transaction Lookup
+```
+https://reverse-proxy.wikey.io/mainnet/full-node/cosmos/tx/v1beta1/txs/TXHASH
+```
+
+---
+
+## Error Reference
+
+| Error / Symptom | Cause | Action |
+|---|---|---|
+| `SSP_HMAC_KEY is not set` | Env var missing at SSP startup | Set `SSP_HMAC_KEY` in child process env before spawning |
+| `SSP_HMAC_KEY must be exactly 64 hex characters` | Wrong format/length | Generate exactly 32 random bytes, encode as 64 lowercase hex chars |
+| `this build only supports -keystore secure` | Tried memory/fs mode on production binary | Spawn with `-keystore secure` |
+| 403 / proof rejected | Stale nonce, wrong key, or missing `-spawned-by-agent` | Confirm flag; delete `.ssp-nonce`; verify correct HMAC key piped to `ssp-util` |
+| `ACCOUNT_NOT_FOUND` | Address not on-chain | Ask user to fund the address first |
+| `USERNAME_TAKEN` | Safe name already registered | Choose a different username |
+| `RPC_CONNECTION_ERROR` | Can't reach the chain | Check network, retry |
+| `wallet-cli exited with code 1` with empty message | Real error in stdout | Run command directly via exec to capture stdout |
+| `malformed proof JSON` | Proof not parsed correctly | Check that SSP server and wallet-cli versions match |
+| Safe snapshot empty after broadcast | Chain not yet validated | Wait ~30s and query again |
+| Policy name/description garbled on-chain | Used `--name`/`--description` CLI flags | Always use stdin for name/description |
