@@ -1,5 +1,7 @@
 # Wikey Wallet Skill
 
+![GitHub release](https://img.shields.io/github/v/release/ronmasuary/Wikey-Wallet-Skill)
+
 SSP agent-child skill for any AI agent that supports `.skill` packages. Provides the Secure Signing Process (SSP) operational guide as an agent system prompt and installs the required binaries (`signing-server`, `ssp-util`, `wallet-cli`).
 
 ## Requirements
