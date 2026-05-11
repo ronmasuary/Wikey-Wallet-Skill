@@ -19,5 +19,6 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: wikey-wallet-skill.skill
           generate_release_notes: true
