@@ -15,6 +15,28 @@ description: >
 
 # SSP Agent-Child Mode — Operational Guide
 
+## Tool Usage
+
+When skill tools are registered (`wallet_keys_create`, `wallet_chain_info`, etc. are
+available), use them — do not use shell_exec or write driver scripts for operations
+covered by tools. Tools handle the full execution including the SSP proof flow for
+tx commands.
+
+The manual Node.js driver described in "Signing Transactions" is a reference only
+— it is not needed when tools are available.
+
+## HMAC Key Rotation
+
+Rotate the HMAC key every 15 minutes via `wallet_hmac_rotate`. Call it between
+requests — never mid-signing-flow. On success, replace your in-memory key with
+the returned `newHmacKey` immediately. Never regenerate the key except via this tool.
+
+## SSP Restart
+
+Never restart, kill, or respawn the SSP signing-server process mid-session.
+If SSP dies, the session is over — terminate the agent and start a fresh one.
+Restarting SSP loses the session HMAC key and likely makes the keystore unrecoverable.
+
 This document is the complete reference for operating the Omnistar blockchain
 via the Secure Signing Process (SSP) in **agent-child mode**: the agent spawns
 SSP, holds the HMAC key in memory, and drives all chain operations exclusively
@@ -56,7 +78,7 @@ Installs: `signing-server`, `ssp-util` (to `~/.ssp/bin`), and `wallet-cli`
 - Implement HMAC-SHA256 yourself — always shell out to `ssp-util proof`.
 - Log, write, persist, or transmit the value of `SSP_HMAC_KEY`.
 - Modify, patch, recompile, or replace `wallet-cli` or `ssp-util` in any way (including edits to `node_modules/`, runtime shims, or forked binaries). These are externally-released packages; local changes are invisible to others, get wiped on reinstall, and paper over real problems.
-- **Use `shell_exec` for any `wallet-cli` command.** Almost every `wallet-cli` command issues interactive stdin prompts (policy selections, names, confirmations, `Enter proof:`). `shell_exec` cannot respond to prompts — it will hang until killed. Use the Node.js driver (see "Signing Transactions") for every `wallet-cli` invocation, passing all expected stdin lines upfront via `stdin_inputs`.
+- **Use `shell_exec` for tx commands** — they require the SSP proof flow. Use the `wallet_tx_*` tools (pass `hmacKey`). For non-tx commands (queries, keys, config), `shell_exec` is acceptable as a last resort if tools are unavailable.
 
 ### When `wallet-cli` appears broken
 

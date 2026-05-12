@@ -14,8 +14,22 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Install deps
+        run: npm install --prefix wikey-wallet-skill
+
+      - name: Build
+        run: npm run build --prefix wikey-wallet-skill
+
+      - name: Stage compiled output
+        run: |
+          mkdir -p .skill-staging/src
+          cp wikey-wallet-skill/dist/index.js .skill-staging/src/index.js
+          cp wikey-wallet-skill/package.json .skill-staging/
+          cp wikey-wallet-skill/SKILL.md .skill-staging/
+          cp -r wikey-wallet-skill/assets .skill-staging/
+
       - name: Build .skill
-        run: zip -r wikey-wallet-skill.skill wikey-wallet-skill/
+        run: cd .skill-staging && zip -r ../wikey-wallet-skill.skill .
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
