@@ -1,0 +1,6 @@
+{
+  "name": "wikey-wallet-skill",
+  "type": "module",
+  "scripts": { "build": "tsc" },
+  "devDependencies": { "typescript": "^5", "@types/node": "^22" }
+}
