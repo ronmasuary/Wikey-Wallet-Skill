@@ -17,19 +17,26 @@ description: >
 
 ## Tool Usage
 
-When skill tools are registered (`wallet_keys_create`, `wallet_chain_info`, etc. are
-available), use them — do not use shell_exec or write driver scripts for operations
-covered by tools. Tools handle the full execution including the SSP proof flow for
-tx commands.
+When skill tools are registered, use them for all wallet operations. Never use
+`shell_exec` for any wallet operation — all operations have dedicated tools.
+`shell_exec` is not a fallback, not a last resort, not acceptable under any
+circumstance for wallet work.
 
-The manual Node.js driver described in "Signing Transactions" is a reference only
-— it is not needed when tools are available.
+Session tools:
+- `wallet_session_start` — call once at the beginning of every session before any `wallet_tx_*` or `wallet_notification_configure` tools
+- `wallet_session_status` — check if a session is already active before starting a new one
+
+Tools handle the full execution including SSP proof flow for tx commands. The manual
+Node.js driver described in "Signing Transactions" is a reference only — it is not
+needed when tools are available.
 
 ## HMAC Key Rotation
 
-Rotate the HMAC key every 15 minutes via `wallet_hmac_rotate`. Call it between
-requests — never mid-signing-flow. On success, replace your in-memory key with
-the returned `newHmacKey` immediately. Never regenerate the key except via this tool.
+Call `wallet_hmac_rotate` every 15 minutes between requests — never mid-signing-flow.
+The skill swaps the key internally; nothing is returned to the agent and no agent-side
+action is needed after the call.
+
+Rotation does NOT reset the nonce file. The nonce continues monotonically across rotations.
 
 ## SSP Restart
 
@@ -78,7 +85,7 @@ Installs: `signing-server`, `ssp-util` (to `~/.ssp/bin`), and `wallet-cli`
 - Implement HMAC-SHA256 yourself — always shell out to `ssp-util proof`.
 - Log, write, persist, or transmit the value of `SSP_HMAC_KEY`.
 - Modify, patch, recompile, or replace `wallet-cli` or `ssp-util` in any way (including edits to `node_modules/`, runtime shims, or forked binaries). These are externally-released packages; local changes are invisible to others, get wiped on reinstall, and paper over real problems.
-- **Use `shell_exec` for tx commands** — they require the SSP proof flow. Use the `wallet_tx_*` tools (pass `hmacKey`). For non-tx commands (queries, keys, config), `shell_exec` is acceptable as a last resort if tools are unavailable.
+- **Never use `shell_exec` for any wallet operation** — all wallet operations have dedicated tools. `shell_exec` is not a fallback. Do not pass `hmacKey` to any tool; the skill manages it internally.
 
 ### When `wallet-cli` appears broken
 
@@ -110,14 +117,17 @@ The agent holds the HMAC key. Responsibilities:
 
 ### Session Startup — Signing Server
 
-**On every session start** (first task after boot or restart):
+**On every session start**, call `wallet_session_start`. The tool handles everything:
 
-1. Kill any existing signing-server: `pkill -f 'signing-server.*-spawned-by-agent'`
-2. Generate a fresh HMAC key in memory (Node.js: `crypto.randomBytes(32).toString('hex')`)
-3. Spawn signing-server with that key in `SSP_HMAC_KEY` env (see Spawning SSP)
-4. Hold the key in memory for the rest of the session
+1. Kills any existing signing-server
+2. Deletes the stale `.ssp-nonce` file (each new SSP session resets the nonce to 0)
+3. Generates a fresh HMAC key in memory — never exposed to the agent
+4. Spawns signing-server with that key in `SSP_HMAC_KEY` env
+5. Waits for SSP to be ready (port probe, max 10s)
 
-**The nonce file is NOT lost on respawn** — it persists on disk at `<workspace>/.ssp-nonce`. Only the HMAC key is regenerated. Always use a consistent `--nonce-file` path so nonce state survives server restarts.
+Use `wallet_session_status` to check if a session is already active before calling `wallet_session_start`.
+
+**Nonce file across rotations:** The nonce file is NOT deleted on rotation — the nonce continues monotonically across rotations. Only `wallet_session_start` (SSP restart) deletes it.
 
 ---
 
@@ -633,9 +643,10 @@ Always resolve usernames to addresses before using them in transactions.
 The nonce file (`<workspace>/.ssp-nonce`) tracks the monotonically increasing
 nonce counter. It does **not** contain the HMAC key or any secret.
 
-**Delete it whenever SSP restarts.** Each new session generates a fresh HMAC
-key and the server's nonce resets to 0. `ssp-util` manages this file
-automatically — never write to it directly.
+`wallet_session_start` deletes it automatically before spawning a new SSP process.
+Each new SSP session starts with nonce 0. Across rotations, the nonce is preserved
+and continues monotonically — `wallet_hmac_rotate` does NOT delete it.
+Never write to this file directly; `ssp-util` owns it.
 
 ---
 
