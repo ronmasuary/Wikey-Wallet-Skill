@@ -1,10 +1,16 @@
 import { execFile as execFileCb, spawn } from 'node:child_process';
+import { createConnection } from 'node:net';
+import { unlink } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
 const execFile = promisify(execFileCb);
 const nonceFile = () => path.join(process.cwd(), '.ssp-nonce');
+
+// SSP session state — key lives here only, never exposed to agent
+let sessionHmacKey: string | null = null;
+let signingServerProcess: ReturnType<typeof spawn> | null = null;
 
 // ─── Proof driver helpers ─────────────────────────────────────────────────────
 
@@ -416,6 +422,17 @@ const tools = [
     description: 'Show the path to the wallet-cli config file',
     inputSchema: { type: 'object', properties: {} },
   },
+  // Session tools
+  {
+    name: 'wallet_session_start',
+    description: 'Start a secure SSP session. Generates HMAC key internally and spawns signing-server. Must be called once at the beginning of every session before any wallet_tx_* or wallet_notification_configure tools. Kills any existing signing-server first. Key is held in skill memory only — never exposed to the agent.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'wallet_session_status',
+    description: 'Check if an SSP session is currently active. Returns { active: boolean, pid: number|null }. Call before wallet_session_start to avoid killing a live session.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
   // Signing tools
   {
     name: 'wallet_tx_create_safe',
@@ -424,9 +441,8 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string', description: 'Safe username (letters, numbers, dots only; no leading/trailing/consecutive dots)' },
-        hmacKey: { type: 'string', description: '64-hex HMAC key held in agent memory' },
       },
-      required: ['username', 'hmacKey'],
+      required: ['username'],
     },
   },
   {
@@ -438,9 +454,8 @@ const tools = [
         from: { type: 'string', description: 'Sender omnistar1... address' },
         to: { type: 'string', description: 'Recipient omnistar1... address' },
         amount: { type: 'string', description: 'Amount with denom (e.g. 1000nost)' },
-        hmacKey: { type: 'string', description: '64-hex HMAC key' },
       },
-      required: ['from', 'to', 'amount', 'hmacKey'],
+      required: ['from', 'to', 'amount'],
     },
   },
   {
@@ -454,12 +469,11 @@ const tools = [
         amount: { type: 'number', description: 'Amount in smallest units (display value × smallCoin)' },
         asset: { type: 'string', description: 'Asset symbol (e.g. BTC, USDC, OST)' },
         feePriority: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Transaction fee priority' },
-        hmacKey: { type: 'string', description: '64-hex HMAC key' },
         tokenAddress: { type: 'string', description: 'ERC20 contract address (0x + 40 hex) — required for ERC20 assets' },
         chain: { type: 'string', enum: ['ethereum', 'polygon', 'base'], description: 'ERC20 chain — required for ERC20 assets' },
         smallCoin: { type: 'number', description: 'ERC20 token divisor — required for ERC20 assets' },
       },
-      required: ['destination', 'to', 'amount', 'asset', 'feePriority', 'hmacKey'],
+      required: ['destination', 'to', 'amount', 'asset', 'feePriority'],
     },
   },
   {
@@ -471,19 +485,14 @@ const tools = [
         destination: { type: 'string', description: 'Safe address (omnistar1...)' },
         vote: { type: 'string', enum: ['YES', 'NO', 'ABSTAIN'] },
         signature: { type: 'string', description: 'Omnistar tx hash of the object being voted on' },
-        hmacKey: { type: 'string', description: '64-hex HMAC key' },
       },
-      required: ['destination', 'vote', 'signature', 'hmacKey'],
+      required: ['destination', 'vote', 'signature'],
     },
   },
   {
     name: 'wallet_tx_request_recovery',
     description: 'Request account recovery (signs with new key, references original account). Returns result for helper deeplink construction.',
-    inputSchema: {
-      type: 'object',
-      properties: { hmacKey: { type: 'string', description: '64-hex HMAC key' } },
-      required: ['hmacKey'],
-    },
+    inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'wallet_tx_approve_recovery',
@@ -493,9 +502,8 @@ const tools = [
       properties: {
         oldaccount: { type: 'string', description: 'Original account username being recovered' },
         newaccount: { type: 'string', description: 'New omnistar1... address replacing the old one' },
-        hmacKey: { type: 'string', description: '64-hex HMAC key' },
       },
-      required: ['oldaccount', 'newaccount', 'hmacKey'],
+      required: ['oldaccount', 'newaccount'],
     },
   },
   {
@@ -506,7 +514,6 @@ const tools = [
       properties: {
         destination: { type: 'string', description: 'Safe address (omnistar1...)' },
         applyOn: { type: 'string', description: 'Comma-separated classes (e.g. transaction, profile, transaction,profile)' },
-        hmacKey: { type: 'string', description: '64-hex HMAC key' },
         conditions: {
           type: 'array',
           description: 'Policy conditions to enable',
@@ -527,7 +534,7 @@ const tools = [
         name: { type: 'string', description: 'Policy name (optional)' },
         description: { type: 'string', description: 'Policy description (optional)' },
       },
-      required: ['destination', 'applyOn', 'hmacKey', 'conditions'],
+      required: ['destination', 'applyOn', 'conditions'],
     },
   },
   {
@@ -536,12 +543,11 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        hmacKey: { type: 'string', description: '64-hex HMAC key' },
         addHelpers: { type: 'array', items: { type: 'string' }, description: 'Helper addresses/usernames to add' },
         removeHelpers: { type: 'array', items: { type: 'string' }, description: 'Helper addresses to remove (skill resolves numbered index from CLI output)' },
         threshold: { type: 'number', description: 'Number of helpers required for recovery (integer count, not percentage)' },
       },
-      required: ['hmacKey', 'threshold'],
+      required: ['threshold'],
     },
   },
   {
@@ -550,7 +556,6 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        hmacKey: { type: 'string', description: '64-hex HMAC key' },
         email: { type: 'string', description: 'Comma-separated email addresses' },
         sms: { type: 'string', description: 'Comma-separated phone numbers' },
         webhook: { type: 'string', description: 'Comma-separated webhook URLs' },
@@ -559,19 +564,13 @@ const tools = [
         address: { type: 'string', description: 'Override config user.address' },
         url: { type: 'string', description: 'Override config wikeyAuthUrl' },
       },
-      required: ['hmacKey'],
+      required: [],
     },
   },
   {
     name: 'wallet_hmac_rotate',
-    description: 'Rotate the HMAC key via ssp-util. Call every 15 minutes between requests — never mid-signing. Replace your in-memory key with the returned newHmacKey immediately.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        currentHmacKey: { type: 'string', description: 'Current 64-hex HMAC key held in memory' },
-      },
-      required: ['currentHmacKey'],
-    },
+    description: 'Rotate the HMAC key via ssp-util. Call every 15 minutes between requests — never mid-signing. Key is swapped internally; nothing is returned to the agent.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
   },
 ];
 
@@ -579,6 +578,57 @@ const tools = [
 
 async function execute(toolName: string, input: Record<string, unknown>): Promise<unknown> {
   switch (toolName) {
+    // Session tools
+    case 'wallet_session_start': {
+      try { await execFile('pkill', ['-f', 'signing-server.*-spawned-by-agent']); } catch { /* none running */ }
+      if (signingServerProcess) {
+        try { signingServerProcess.kill('SIGTERM'); } catch { /* ignore */ }
+        signingServerProcess = null;
+      }
+      sessionHmacKey = null;
+
+      try { await unlink(nonceFile()); } catch { /* may not exist */ }
+
+      const hmacKey = crypto.randomBytes(32).toString('hex');
+      const kek = crypto.randomBytes(32).toString('base64');
+
+      const proc = spawn(
+        path.join(process.env.HOME ?? '/root', '.ssp', 'bin', 'signing-server'),
+        ['-spawned-by-agent', '-kek-provider', 'env', '-keystore', 'secure'],
+        {
+          env: { ...process.env, SSP_HMAC_KEY: hmacKey, SSP_KEK: kek },
+          detached: false,
+          stdio: 'ignore',
+        }
+      );
+
+      proc.on('error', () => {
+        signingServerProcess = null;
+        sessionHmacKey = null;
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 10_000;
+        function probe() {
+          const s = createConnection({ port: 8080, host: '127.0.0.1' });
+          s.on('connect', () => { s.destroy(); resolve(); });
+          s.on('error', () => {
+            if (Date.now() >= deadline) { reject(new Error('SSP did not start within 10s')); return; }
+            setTimeout(probe, 200);
+          });
+        }
+        probe();
+      });
+
+      signingServerProcess = proc;
+      sessionHmacKey = hmacKey;
+
+      return JSON.stringify({ ok: true, pid: proc.pid });
+    }
+    case 'wallet_session_status': {
+      const active = signingServerProcess !== null && sessionHmacKey !== null;
+      return JSON.stringify({ active, pid: signingServerProcess?.pid ?? null });
+    }
     // Query tools
     case 'wallet_chain_info':
       return runQuery(['query', 'chain-info']);
@@ -644,18 +694,21 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       return runQuery(['config', 'path']);
     // Signing tools
     case 'wallet_tx_create_safe': {
-      const { username, hmacKey } = input as { username: string; hmacKey: string };
-      return runSigning(hmacKey, ['tx', 'create-safe', '--username', username, '--broadcast']);
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { username } = input as { username: string };
+      return runSigning(sessionHmacKey, ['tx', 'create-safe', '--username', username, '--broadcast']);
     }
     case 'wallet_tx_send': {
-      const { from, to, amount, hmacKey } = input as { from: string; to: string; amount: string; hmacKey: string };
-      return runSigning(hmacKey, ['tx', 'send', '--from', from, '--to', to, '--amount', amount, '--broadcast']);
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { from, to, amount } = input as { from: string; to: string; amount: string };
+      return runSigning(sessionHmacKey, ['tx', 'send', '--from', from, '--to', to, '--amount', amount, '--broadcast']);
     }
     case 'wallet_tx_create_transaction': {
-      const { destination, to, amount, asset, feePriority, hmacKey, tokenAddress, chain, smallCoin } =
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { destination, to, amount, asset, feePriority, tokenAddress, chain, smallCoin } =
         input as {
           destination: string; to: string; amount: number; asset: string;
-          feePriority: string; hmacKey: string;
+          feePriority: string;
           tokenAddress?: string; chain?: string; smallCoin?: number;
         };
       const args = [
@@ -670,12 +723,13 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (chain) args.push('--chain', chain);
       if (smallCoin !== undefined) args.push('--small-coin', smallCoin.toString());
       args.push('--broadcast');
-      return runSigning(hmacKey, args);
+      return runSigning(sessionHmacKey, args);
     }
     case 'wallet_tx_vote': {
-      const { destination, vote, signature, hmacKey } =
-        input as { destination: string; vote: string; signature: string; hmacKey: string };
-      return runSigning(hmacKey, [
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { destination, vote, signature } =
+        input as { destination: string; vote: string; signature: string };
+      return runSigning(sessionHmacKey, [
         'tx', 'vote',
         '--destination', destination,
         '--vote', vote,
@@ -684,13 +738,14 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       ]);
     }
     case 'wallet_tx_request_recovery': {
-      const { hmacKey } = input as { hmacKey: string };
-      return runSigning(hmacKey, ['tx', 'request-recovery', '--broadcast']);
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      return runSigning(sessionHmacKey, ['tx', 'request-recovery', '--broadcast']);
     }
     case 'wallet_tx_approve_recovery': {
-      const { oldaccount, newaccount, hmacKey } =
-        input as { oldaccount: string; newaccount: string; hmacKey: string };
-      return runSigning(hmacKey, [
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { oldaccount, newaccount } =
+        input as { oldaccount: string; newaccount: string };
+      return runSigning(sessionHmacKey, [
         'tx', 'approve-recovery',
         '--oldaccount', oldaccount,
         '--newaccount', newaccount,
@@ -698,12 +753,13 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       ]);
     }
     case 'wallet_tx_create_policy': {
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const typed = input as {
-        destination: string; applyOn: string; hmacKey: string;
+        destination: string; applyOn: string;
         conditions: PolicyCondition[]; name?: string; description?: string;
       };
       const preProofInputs = buildPolicyStdinInputs(typed);
-      return runSigning(typed.hmacKey, [
+      return runSigning(sessionHmacKey, [
         'tx', 'create-policy',
         '--destination', typed.destination,
         '--apply-on', typed.applyOn,
@@ -711,14 +767,16 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       ], preProofInputs);
     }
     case 'wallet_tx_edit_helpers': {
-      const { hmacKey, addHelpers = [], removeHelpers = [], threshold } =
-        input as { hmacKey: string; addHelpers?: string[]; removeHelpers?: string[]; threshold: number };
-      return runSigningEditHelpers(hmacKey, addHelpers, removeHelpers, threshold);
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { addHelpers = [], removeHelpers = [], threshold } =
+        input as { addHelpers?: string[]; removeHelpers?: string[]; threshold: number };
+      return runSigningEditHelpers(sessionHmacKey, addHelpers, removeHelpers, threshold);
     }
     case 'wallet_notification_configure': {
-      const { hmacKey, email, sms, webhook, telegram, push, address, url } =
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { email, sms, webhook, telegram, push, address, url } =
         input as {
-          hmacKey: string; email?: string; sms?: string; webhook?: string;
+          email?: string; sms?: string; webhook?: string;
           telegram?: string; push?: string; address?: string; url?: string;
         };
       const args = ['notification', 'configure'];
@@ -730,11 +788,13 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (address) args.push('--address', address);
       if (url) args.push('--url', url);
       args.push('--broadcast');
-      return runSigning(hmacKey, args);
+      return runSigning(sessionHmacKey, args);
     }
     case 'wallet_hmac_rotate': {
-      const { currentHmacKey } = input as { currentHmacKey: string };
-      return runHmacRotation(currentHmacKey);
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { newHmacKey } = await runHmacRotation(sessionHmacKey);
+      sessionHmacKey = newHmacKey;
+      return JSON.stringify({ ok: true });
     }
     default:
       throw new Error(`Unknown tool: ${toolName}`);
@@ -749,19 +809,18 @@ export default {
   tools,
   execute,
   systemPrompt: `
-When wallet skill tools are registered (wallet_keys_create, wallet_chain_info, etc. are available),
-use them for all wallet operations. Do not use shell_exec or write driver scripts for operations
-covered by tools. Tools handle the full execution including the SSP proof flow for tx commands.
+Call wallet_session_start once at the beginning of every session before using any wallet_tx_* or wallet_notification_configure tools.
+Use wallet_session_status to check if a session is already active before starting a new one.
 
-HMAC key rotation: Call wallet_hmac_rotate every 15 minutes between requests — never mid-signing.
-On success, replace your in-memory key with the returned newHmacKey immediately.
+Never use shell_exec for any wallet operation. All wallet operations — queries, key management, config, signing, and session startup — have dedicated tools. shell_exec is never needed and never acceptable for wallet work, even as a fallback.
 
-Never restart the SSP signing-server mid-session. If SSP dies, the session is over — terminate and start fresh.
-Restarting SSP loses the HMAC key and likely makes the keystore unrecoverable.
+Do not pass hmacKey to any tool. The skill manages the HMAC key internally.
 
-wallet_notification_configure returns a token credential in the result JSON.
-Display the token to the user exactly once with an explanation (e.g. "This is your notification token — save it securely"), then drop it.
-If --webhook was used, offer to help scaffold a webhook receiver.
+Call wallet_hmac_rotate every 15 minutes between requests — never mid-signing. The skill swaps the key internally; no agent action needed after the call.
+
+Never restart, kill, or respawn the SSP signing-server mid-session. If SSP dies, the session is over — terminate and start fresh. Restarting SSP loses the HMAC key and likely makes the keystore unrecoverable.
+
+wallet_notification_configure returns a token credential in the result JSON. Display the token to the user exactly once with an explanation (e.g. "This is your notification token — save it securely"), then drop it. If --webhook was used, offer to help scaffold a webhook receiver.
 
 wallet_tx_create_transaction: amount must be in smallest units (display value × smallCoin from wallet_assets).
 wallet_tx_vote: signature is the Omnistar tx hash of the object being voted on (SIGNATURE field from snapshot).
