@@ -185,8 +185,10 @@ function buildPolicyStdinInputs(opts: {
     }
   }
 
-  lines.push((opts.name ?? '') + '\n');
-  lines.push((opts.description ?? '') + '\n');
+  if (!onlyTx) {
+    lines.push((opts.name ?? '') + '\n');
+    lines.push((opts.description ?? '') + '\n');
+  }
   return lines;
 }
 
@@ -374,7 +376,7 @@ const tools = [
   },
   {
     name: 'wallet_keys_create',
-    description: 'Generate a new keypair in the signing-server. Returns the new omnistar1... address.',
+    description: 'Generate a new keypair in the signing-server. Returns the new omnistar1... address. Requires an active SSP session (call wallet_session_start first).',
     inputSchema: {
       type: 'object',
       properties: { setDefault: { type: 'boolean', description: 'Set this key as the default' } },
@@ -670,10 +672,11 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       return runQuery(['keys', 'get', '--id', id]);
     }
     case 'wallet_keys_create': {
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { setDefault } = input as { setDefault?: boolean };
       const args = ['keys', 'create'];
       if (setDefault) args.push('--set-default');
-      return runQuery(args);
+      return runSigning(sessionHmacKey, args);
     }
     // Config tools
     case 'wallet_config_show':
@@ -787,7 +790,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (push) args.push('--push', push);
       if (address) args.push('--address', address);
       if (url) args.push('--url', url);
-      args.push('--broadcast');
+      args.push('--sign');
       return runSigning(sessionHmacKey, args);
     }
     case 'wallet_hmac_rotate': {
