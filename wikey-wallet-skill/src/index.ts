@@ -592,13 +592,12 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       try { await unlink(nonceFile()); } catch { /* may not exist */ }
 
       const hmacKey = crypto.randomBytes(32).toString('hex');
-      const kek = crypto.randomBytes(32).toString('base64');
 
       const proc = spawn(
         path.join(process.env.HOME ?? '/root', '.ssp', 'bin', 'signing-server'),
-        ['-spawned-by-agent', '-kek-provider', 'env', '-keystore', 'secure'],
+        ['-spawned-by-agent', '-keystore', 'secure'],
         {
-          env: { ...process.env, SSP_HMAC_KEY: hmacKey, SSP_KEK: kek },
+          env: { ...process.env, SSP_HMAC_KEY: hmacKey },
           detached: false,
           stdio: 'ignore',
         }
