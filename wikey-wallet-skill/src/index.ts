@@ -1,5 +1,6 @@
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
+import { readFileSync } from 'node:fs';
 import { unlink } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
@@ -593,11 +594,29 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
 
       const hmacKey = crypto.randomBytes(32).toString('hex');
 
+      // Dev workaround: if ~/.ssp/dev.kek exists, inject it so SSP reuses the same
+      // KEK across restarts and the keystore survives. Absent = prod behavior (SSP generates own KEK).
+      let devKek: string | undefined;
+      try {
+        devKek = readFileSync(
+          path.join(process.env.HOME ?? '/root', '.ssp', 'dev.kek'),
+          'utf8'
+        ).trim() || undefined;
+      } catch { /* file absent = prod mode */ }
+
       const proc = spawn(
         path.join(process.env.HOME ?? '/root', '.ssp', 'bin', 'signing-server'),
-        ['-spawned-by-agent', '-keystore', 'secure'],
+        [
+          '-spawned-by-agent',
+          ...(devKek ? ['-kek-provider', 'env'] : []),
+          '-keystore', 'secure',
+        ],
         {
-          env: { ...process.env, SSP_HMAC_KEY: hmacKey },
+          env: {
+            ...process.env,
+            SSP_HMAC_KEY: hmacKey,
+            ...(devKek ? { SSP_KEK: devKek } : {}),
+          },
           detached: false,
           stdio: 'ignore',
         }
