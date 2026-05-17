@@ -181,8 +181,6 @@ interface PolicyCondition {
   minAmount?: number;
   maxAmount?: number;
   symbols?: string[];
-  allowedAddresses?: string[];
-  threshold?: number;
 }
 
 function buildPolicyStdinInputs(opts: {
@@ -193,11 +191,9 @@ function buildPolicyStdinInputs(opts: {
 }): string[] {
   const classes = opts.applyOn.split(',').map(s => s.trim().toLowerCase());
   const onlyTx = classes.length === 1 && classes[0] === 'transaction';
-  const onlyProfile = classes.length === 1 && classes[0] === 'profile';
 
   const menuMap: Record<string, number> = { voting: 1 };
   if (onlyTx) { menuMap['amount'] = 2; menuMap['symbols'] = 3; }
-  if (onlyProfile) { menuMap['allow_updateuseraddress'] = 2; }
 
   const selected = opts.conditions
     .map(c => ({ c, idx: menuMap[c.type.toLowerCase()] }))
@@ -215,16 +211,12 @@ function buildPolicyStdinInputs(opts: {
       lines.push((c.maxAmount ?? 0).toString() + '\n');
     } else if (t === 'symbols') {
       lines.push((c.symbols ?? []).join(',') + '\n');
-    } else if (t === 'allow_updateuseraddress') {
-      lines.push((c.allowedAddresses ?? []).join(',') + '\n');
-      lines.push((c.threshold ?? 100).toString() + '\n');
     }
   }
 
-  if (!onlyTx) {
-    lines.push((opts.name ?? '') + '\n');
-    lines.push((opts.description ?? '') + '\n');
-  }
+  // wallet-cli always prompts for name/description regardless of applyOn
+  lines.push((opts.name ?? '') + '\n');
+  lines.push((opts.description ?? '') + '\n');
   return lines;
 }
 
@@ -561,25 +553,23 @@ const tools = [
   },
   {
     name: 'wallet_tx_create_policy',
-    description: 'Create a policy on a safe. Never pass name/description as CLI flags — this tool feeds them via stdin. Condition menu indices depend on applyOn.',
+    description: 'Create a policy on a safe. Valid applyOn values: group, user, transaction, policy, profile (comma-separated for multiple). MIXING RULE: amount and symbols conditions ONLY available when applyOn is exactly "transaction" (single value) — any other value or mix → voting only. Never pass name/description as CLI flags — always feed via conditions/name/description fields. Name/description prompts always appear (empty string allowed).',
     inputSchema: {
       type: 'object',
       properties: {
         destination: { type: 'string', description: 'Safe address (omnistar1...)' },
-        applyOn: { type: 'string', description: 'Comma-separated classes (e.g. transaction, profile, transaction,profile)' },
+        applyOn: { type: 'string', description: 'Comma-separated apply-on classes. Valid: group, user, transaction, policy, profile. Mix rule: amount/symbols only when value is exactly "transaction" alone.' },
         conditions: {
           type: 'array',
           description: 'Policy conditions to enable',
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['voting', 'amount', 'symbols', 'allow_updateUserAddress'] },
+              type: { type: 'string', enum: ['voting', 'amount', 'symbols'] },
               votingQty: { type: 'number', description: 'Voting threshold percentage (0-100), for type=voting' },
-              minAmount: { type: 'number', description: 'Minimum amount, for type=amount' },
-              maxAmount: { type: 'number', description: 'Maximum amount, for type=amount' },
-              symbols: { type: 'array', items: { type: 'string' }, description: 'Allowed symbols, for type=symbols' },
-              allowedAddresses: { type: 'array', items: { type: 'string' }, description: 'Allowed source addresses, for type=allow_updateUserAddress' },
-              threshold: { type: 'number', description: 'Threshold percentage (0-100), for type=allow_updateUserAddress' },
+              minAmount: { type: 'number', description: 'Minimum amount, for type=amount. Only when applyOn is exactly "transaction".' },
+              maxAmount: { type: 'number', description: 'Maximum amount, for type=amount. Only when applyOn is exactly "transaction".' },
+              symbols: { type: 'array', items: { type: 'string' }, description: 'Allowed symbols, for type=symbols. Only when applyOn is exactly "transaction".' },
             },
             required: ['type'],
           },
@@ -588,6 +578,50 @@ const tools = [
         description: { type: 'string', description: 'Policy description (optional)' },
       },
       required: ['destination', 'applyOn', 'conditions'],
+    },
+  },
+  {
+    name: 'wallet_tx_edit_policy',
+    description: 'Edit an existing policy on a safe. Same applyOn and conditions rules as wallet_tx_create_policy. MIXING RULE: amount and symbols only when applyOn is exactly "transaction". policyId and signature come from wallet_profile output (find policy by id, read its SIGNATURE field).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        destination: { type: 'string', description: 'Safe address (omnistar1...)' },
+        policyId: { type: 'string', description: 'Policy ID (from wallet_profile output)' },
+        signature: { type: 'string', description: 'On-chain SIGNATURE of the policy (from wallet_profile output)' },
+        applyOn: { type: 'string', description: 'Comma-separated apply-on classes. Valid: group, user, transaction, policy, profile.' },
+        conditions: {
+          type: 'array',
+          description: 'Policy conditions to enable',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['voting', 'amount', 'symbols'] },
+              votingQty: { type: 'number', description: 'Voting threshold percentage (0-100), for type=voting' },
+              minAmount: { type: 'number', description: 'Minimum amount, for type=amount. Only when applyOn is exactly "transaction".' },
+              maxAmount: { type: 'number', description: 'Maximum amount, for type=amount. Only when applyOn is exactly "transaction".' },
+              symbols: { type: 'array', items: { type: 'string' }, description: 'Allowed symbols, for type=symbols. Only when applyOn is exactly "transaction".' },
+            },
+            required: ['type'],
+          },
+        },
+        name: { type: 'string', description: 'Policy name (optional, for non-transaction-only applyOn)' },
+        description: { type: 'string', description: 'Policy description (optional, for non-transaction-only applyOn)' },
+      },
+      required: ['destination', 'policyId', 'signature', 'applyOn', 'conditions'],
+    },
+  },
+  {
+    name: 'wallet_tx_delete_policy',
+    description: 'Soft-delete a policy from a safe. Data remains on-chain. No stdin prompts. policyId and signature come from wallet_profile output.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        destination: { type: 'string', description: 'Safe address (omnistar1...)' },
+        policyId: { type: 'string', description: 'Policy ID (from wallet_profile output)' },
+        signature: { type: 'string', description: 'On-chain SIGNATURE of the policy (from wallet_profile output)' },
+      },
+      required: ['destination', 'policyId', 'signature'],
     },
   },
   {
@@ -837,6 +871,34 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
         '--broadcast',
       ], preProofInputs);
     }
+    case 'wallet_tx_edit_policy': {
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const typed = input as {
+        destination: string; policyId: string; signature: string;
+        applyOn: string; conditions: PolicyCondition[]; name?: string; description?: string;
+      };
+      const preProofInputs = buildPolicyStdinInputs(typed);
+      return runSigning(sessionHmacKey, [
+        'tx', 'edit-policy',
+        '--destination', typed.destination,
+        '--policy-id', typed.policyId,
+        '--signature', typed.signature,
+        '--apply-on', typed.applyOn,
+        '--broadcast',
+      ], preProofInputs);
+    }
+    case 'wallet_tx_delete_policy': {
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { destination, policyId, signature } =
+        input as { destination: string; policyId: string; signature: string };
+      return runSigning(sessionHmacKey, [
+        'tx', 'delete-policy',
+        '--destination', destination,
+        '--policy-id', policyId,
+        '--signature', signature,
+        '--broadcast',
+      ]);
+    }
     case 'wallet_tx_edit_helpers': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { addHelpers = [], removeHelpers = [], threshold } =
@@ -895,6 +957,8 @@ wallet_notification_configure returns a token credential in the result JSON. Dis
 
 wallet_tx_create_transaction: amount must be in smallest units (display value × smallCoin from wallet_assets).
 wallet_tx_vote: signature is the Omnistar tx hash of the object being voted on (SIGNATURE field from snapshot).
-wallet_tx_create_policy: never pass name/description as CLI flags — always use the conditions array and name/description fields.
+wallet_tx_create_policy / wallet_tx_edit_policy: MIXING RULE — amount and symbols conditions ONLY available when applyOn is exactly "transaction" (single value). Any other value or combination → voting only. Never pass name/description as CLI flags — always supply via the name/description fields. Name/description prompts always appear regardless of applyOn; pass empty string to skip.
+wallet_tx_delete_policy: soft-delete only — data remains on-chain. No stdin prompts needed.
+wallet_tx_edit_policy / wallet_tx_delete_policy: policyId and signature come from wallet_profile output (find policy by id field, read its SIGNATURE field).
   `.trim(),
 };
