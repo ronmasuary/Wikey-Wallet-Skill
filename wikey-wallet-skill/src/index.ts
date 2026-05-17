@@ -938,7 +938,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
 
 export default {
   name: 'wikey-wallet-skill',
-  version: '2.0.0',
+  version: '2.1.3',
   tools,
   execute,
   systemPrompt: `
