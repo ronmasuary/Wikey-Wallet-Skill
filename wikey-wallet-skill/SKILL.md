@@ -339,24 +339,52 @@ child.on("close", code => {
 Pass inputs as newline-separated strings via stdin. **Never use `--name` or
 `--description` as CLI flags.**
 
-### `tx create-policy --apply-on profile`
+### MIXING RULE — which conditions are available
+
+| applyOn value(s) | Available conditions | Name/Description prompts? |
+|---|---|---|
+| `transaction` (alone) | voting, amount, symbols | YES (empty OK) |
+| `group`, `user`, `policy`, `profile` (alone) | voting only | YES |
+| any mix (e.g. `transaction,group`) | voting only | YES |
+
+> **`amount` and `symbols` are ONLY available when `--apply-on` is exactly
+> `transaction` with no other values.** Any other combination → voting only.
+
+> `profile`'s `allow_updateUserAddress` policy is pre-built. Do NOT pass
+> `allow_updateUserAddress` as a condition type. Manage it via `tx edit-helpers`.
+
+> **Name/description prompts always appear** regardless of applyOn — wallet-cli
+> always asks. Pass empty string to skip.
+
+### `tx create-policy --apply-on transaction` (alone)
+
+Menu: `1` = Voting, `2` = Amount, `3` = Symbols.
 
 | Prompt | Answer |
 |---|---|
-| `Your selection:` | `2` (Allow Update User Address) or `1` (Voting) |
-| `Enter allowed source addresses (comma-separated):` | address(es) or empty |
-| `Enter threshold percentage (0-100):` | e.g. `100` |
+| `Your selection:` | comma-separated indices, e.g. `1` or `1,2` or `2,3` or `1,2,3` |
+| *(if Voting)* `Enter voting quantity (percentage, 0-100):` | e.g. `100` |
+| *(if Amount)* `Enter min amount:` | e.g. `0` |
+| *(if Amount)* `Enter max amount:` | e.g. `1000` |
+| *(if Symbols)* `Enter symbols (comma-separated):` | e.g. `BTC,ETH` |
 | `Enter policy name (optional, press Enter to skip):` | name or empty |
 | `Enter policy description (optional, press Enter to skip):` | description or empty |
 
-### `tx create-policy --apply-on transaction`
+### `tx create-policy` — all other applyOn values
+
+Applies to: `group`, `user`, `policy`, `profile` (alone), or any mix including `transaction,group`.
+Menu: `1` = Voting (only option).
 
 | Prompt | Answer |
 |---|---|
-| `Your selection:` | `1` (Voting) |
+| `Your selection:` | `1` |
 | `Enter voting quantity (percentage, 0-100):` | e.g. `100` |
+| `Enter policy name (optional, press Enter to skip):` | name or empty |
+| `Enter policy description (optional, press Enter to skip):` | description or empty |
 
-### `tx edit-policy` — same prompt order as `create-policy`.
+### `tx edit-policy` — same prompt order as `create-policy` for the matching applyOn.
+
+`tx delete-policy` — no interactive prompts; flags only.
 
 ---
 
@@ -508,21 +536,31 @@ Plain Cosmos bank transfer of OST out of an address that directly holds it. No s
 
 ### `tx create-policy`
 ```bash
-wallet-cli tx create-policy --destination ADDR --apply-on profile --broadcast
-# stdin: "2\nALLOWED_ADDR\n100\nPolicy Name\nDescription\n"
+# transaction-only (amount + symbols available; name/description always prompted — pass empty to skip):
+wallet-cli tx create-policy --destination ADDR --apply-on transaction --broadcast
+# stdin (voting + amount example): "1,2\n100\n0\n1000\n\n\n"
+
+# all other applyOn values (voting only):
+wallet-cli tx create-policy --destination ADDR --apply-on group --broadcast
+# stdin: "1\n100\nPolicy Name\nDescription\n"
 ```
+Valid `--apply-on`: `group`, `user`, `transaction`, `policy`, `profile`. Comma-separate for multiple.
+**MIXING RULE:** `amount`/`symbols` only when `--apply-on transaction` is the sole value.
 
 ### `tx edit-policy`
 ```bash
-wallet-cli tx edit-policy --destination ADDR --policy-id POLICY_ID --signature SIG --apply-on profile --broadcast
-# stdin: "2\nALLOWED_ADDR\n100\nPolicy Name\nDescription\n"
+wallet-cli tx edit-policy --destination ADDR --policy-id POLICY_ID --signature SIG \
+  --apply-on transaction --broadcast
+# stdin: same pattern as create-policy for the matching applyOn
 ```
+`POLICY_ID` and `SIG` — from `wallet-cli query profile --address ADDR`, find policy by `id`, read its `SIGNATURE` field.
 
 ### `tx delete-policy`
 ```bash
 wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature SIG --broadcast
 ```
-⚠️ Soft-delete only. Data remains on-chain.
+⚠️ Soft-delete only. Data remains on-chain. No stdin prompts.
+`POLICY_ID` and `SIG` — from `wallet-cli query profile --address ADDR`.
 
 ### `tx create-user`
 ```bash
