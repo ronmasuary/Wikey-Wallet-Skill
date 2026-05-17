@@ -13,6 +13,26 @@ const nonceFile = () => path.join(process.cwd(), '.ssp-nonce');
 let sessionHmacKey: string | null = null;
 let signingServerProcess: ReturnType<typeof spawn> | null = null;
 
+// ─── Timeout helper ───────────────────────────────────────────────────────────
+
+function withKillTimeout<T>(
+  ms: number,
+  label: string,
+  child: ReturnType<typeof spawn>,
+  promise: Promise<T>,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      reject(new Error(`${label} timed out after ${ms / 1000}s`));
+    }, ms);
+    promise.then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 // ─── Proof driver helpers ─────────────────────────────────────────────────────
 
 function parseSignRequest(buf: string): { unsignedData: string; signingPubKey: string } | null {
@@ -36,13 +56,13 @@ function parseSignRequest(buf: string): { unsignedData: string; signingPubKey: s
 }
 
 function computeProof(hmacKey: string, unsignedData: string, signingPubKey: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const p = spawn('ssp-util', [
-      'proof',
-      '--unsigned-data', unsignedData,
-      '--signing-pub-key', signingPubKey,
-      '--nonce-file', nonceFile(),
-    ]);
+  const p = spawn('ssp-util', [
+    'proof',
+    '--unsigned-data', unsignedData,
+    '--signing-pub-key', signingPubKey,
+    '--nonce-file', nonceFile(),
+  ]);
+  const inner = new Promise<string>((resolve, reject) => {
     let out = '', err = '';
     p.stdout.on('data', (c: Buffer) => { out += c.toString(); });
     p.stderr.on('data', (c: Buffer) => { err += c.toString(); });
@@ -53,13 +73,25 @@ function computeProof(hmacKey: string, unsignedData: string, signingPubKey: stri
     p.on('error', (e: Error) => { try { p.kill('SIGTERM'); } catch { /* ignore */ } reject(e); });
     p.stdin.end(hmacKey + '\n');
   });
+  // ssp-util is a compiled binary that may ignore SIGTERM — escalate to SIGKILL at T+22s
+  return new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try { p.kill('SIGTERM'); } catch { /* ignore */ }
+      setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* ignore */ } }, 2_000);
+      reject(new Error('computeProof timed out after 20s'));
+    }, 20_000);
+    inner.then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
 }
 
 // ─── Non-signing query runner ─────────────────────────────────────────────────
 
 async function runQuery(args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFile('wallet-cli', args);
+    const { stdout } = await execFile('wallet-cli', args, { timeout: 30_000 });
     return stdout.trim();
   } catch (e: unknown) {
     const err = e as { stderr?: string; stdout?: string; code?: number };
@@ -75,8 +107,8 @@ async function runSigning(
   args: string[],
   preProofInputs: string[] = [],
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('wallet-cli', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn('wallet-cli', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  const inner = new Promise<string>((resolve, reject) => {
     let stderrBuf = '', stdout = '', proofSent = false;
 
     for (const line of preProofInputs)
@@ -101,6 +133,7 @@ async function runSigning(
     child.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
 
     child.on('close', (code: number | null) => {
+      if (proofSent && code !== 0) return; // proof already rejected; skip double-reject
       if (code === 0) { resolve(stdout.trim()); return; }
       let detail = stderrBuf.slice(-500);
       try {
@@ -113,6 +146,7 @@ async function runSigning(
 
     child.on('error', (e: Error) => reject(e));
   });
+  return withKillTimeout(60_000, 'runSigning', child, inner);
 }
 
 // ─── HMAC rotation ────────────────────────────────────────────────────────────
@@ -121,12 +155,13 @@ async function runHmacRotation(currentHmacKey: string): Promise<{ newHmacKey: st
   const deadline = Date.now() + 30_000;
   for (;;) {
     const newKey = crypto.randomBytes(32).toString('hex');
-    const code = await new Promise<number | null>((resolve, reject) => {
-      const p = spawn('ssp-util', ['rotate', '--nonce-file', nonceFile()]);
+    const p = spawn('ssp-util', ['rotate', '--nonce-file', nonceFile()]);
+    const inner = new Promise<number | null>((resolve, reject) => {
       p.on('error', reject);
       p.on('close', resolve);
       p.stdin.end(currentHmacKey + '\n' + newKey + '\n');
     });
+    const code = await withKillTimeout(10_000, 'ssp-util rotate', p, inner);
     if (code === 0) return { newHmacKey: newKey };
     if ((code === 6 || code === 7) && Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
@@ -195,6 +230,8 @@ function buildPolicyStdinInputs(opts: {
 
 // ─── edit-helpers signing runner (prompt-driven state machine) ────────────────
 
+const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
 async function runSigningEditHelpers(
   hmacKey: string,
   addHelpers: string[],
@@ -213,6 +250,11 @@ async function runSigningEditHelpers(
     let helperList: string[] = [];
     let addIdx = 0;
     let removeIdx = 0;
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      reject(new Error(`runSigningEditHelpers timed out after 90s. Last stderr:\n${allStderr.slice(-400)}`));
+    }, 90_000);
 
     type Phase =
       | 'wait_add' | 'enter_add' | 'another_add'
@@ -252,18 +294,24 @@ async function runSigningEditHelpers(
       } else if (phase === 'enter_remove' && ends('Enter the number of the helper to remove:')) {
         const target = removeHelpers[removeIdx];
         const idx = helperList.findIndex(h => h.toLowerCase().includes(target.toLowerCase()));
-        respond((idx >= 0 ? idx + 1 : 1).toString() + '\n', 'another_remove');
+        if (idx === -1) {
+          clearTimeout(timer);
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
+          reject(new Error(`helper not found in list: "${target}". Available: ${helperList.join(', ')}`));
+          return;
+        }
+        respond((idx + 1).toString() + '\n', 'another_remove');
         removeIdx++;
       } else if (phase === 'another_remove' && ends('Would you like to remove another helper? (y/n):')) {
         if (removeIdx < removeHelpers.length) respond('y\n', 'enter_remove');
         else respond('n\n', 'threshold');
-      } else if (phase === 'threshold' && ends('Enter threshold (number of helpers required, 1-N):')) {
+      } else if (phase === 'threshold' && stderrWindow.includes('Enter threshold (number of helpers required,')) {
         respond(threshold.toString() + '\n', 'proof');
       }
     }
 
     child.stderr.on('data', async (chunk: Buffer) => {
-      const s = chunk.toString();
+      const s = chunk.toString().replace(ANSI_RE, '');
       stderrWindow += s;
       allStderr += s;
       if (proofSent) return;
@@ -275,6 +323,7 @@ async function runSigningEditHelpers(
           child.stdin.write(proof + '\n');
           child.stdin.end();
         } catch (e) {
+          clearTimeout(timer);
           try { child.kill('SIGTERM'); } catch { /* ignore */ }
           reject(e as Error);
         }
@@ -286,6 +335,7 @@ async function runSigningEditHelpers(
     child.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
 
     child.on('close', (code: number | null) => {
+      clearTimeout(timer);
       if (code === 0) { resolve(stdout.trim()); return; }
       let detail = allStderr.slice(-500);
       try {
@@ -296,7 +346,7 @@ async function runSigningEditHelpers(
       reject(new Error(`wallet-cli exit ${code}: ${detail}`));
     });
 
-    child.on('error', (e: Error) => reject(e));
+    child.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
   });
 }
 
