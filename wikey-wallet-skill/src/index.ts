@@ -220,6 +220,46 @@ function buildPolicyStdinInputs(opts: {
   return lines;
 }
 
+// ─── Policy prompt queue (runSigningPrompted) ────────────────────────────────
+
+export function buildPolicyQueue(opts: {
+  applyOn: string;
+  conditions: PolicyCondition[];
+  name?: string;
+  description?: string;
+}): PromptStep[] {
+  const classes = opts.applyOn.split(',').map(s => s.trim().toLowerCase());
+  const onlyTx = classes.length === 1 && classes[0] === 'transaction';
+
+  const menuMap: Record<string, number> = { voting: 1 };
+  if (onlyTx) { menuMap['amount'] = 2; menuMap['symbols'] = 3; }
+
+  const selected = opts.conditions
+    .map(c => ({ c, idx: menuMap[c.type.toLowerCase()] }))
+    .filter(x => x.idx !== undefined)
+    .sort((a, b) => a.idx - b.idx);
+
+  const steps: PromptStep[] = [
+    { match: 'Your selection', respond: () => selected.map(x => x.idx).join(',') + '\n' },
+  ];
+
+  for (const { c } of selected) {
+    const t = c.type.toLowerCase();
+    if (t === 'voting') {
+      steps.push({ match: 'Enter voting quantity', respond: () => (c.votingQty ?? 0).toString() + '\n' });
+    } else if (t === 'amount') {
+      steps.push({ match: 'Enter minimum amount', respond: () => (c.minAmount ?? 0).toString() + '\n' });
+      steps.push({ match: 'Enter maximum amount', respond: () => (c.maxAmount ?? 0).toString() + '\n' });
+    } else if (t === 'symbols') {
+      steps.push({ match: 'Enter symbols (comma-separated', respond: () => (c.symbols ?? []).join(',') + '\n' });
+    }
+  }
+
+  steps.push({ match: 'Enter policy name (optional', respond: () => (opts.name ?? '') + '\n' });
+  steps.push({ match: 'Enter policy description (optional', respond: () => (opts.description ?? '') + '\n' });
+  return steps;
+}
+
 // ─── edit-helpers signing runner (prompt-driven state machine) ────────────────
 
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -988,13 +1028,12 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
         destination: string; applyOn: string;
         conditions: PolicyCondition[]; name?: string; description?: string;
       };
-      const preProofInputs = buildPolicyStdinInputs(typed);
-      return runSigning(sessionHmacKey, [
+      return runSigningPrompted(sessionHmacKey, [
         'tx', 'create-policy',
         '--destination', typed.destination,
         '--apply-on', typed.applyOn,
         '--broadcast',
-      ], preProofInputs);
+      ], buildPolicyQueue(typed));
     }
     case 'wallet_tx_edit_policy': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
@@ -1002,15 +1041,14 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
         destination: string; policyId: string; signature: string;
         applyOn: string; conditions: PolicyCondition[]; name?: string; description?: string;
       };
-      const preProofInputs = buildPolicyStdinInputs(typed);
-      return runSigning(sessionHmacKey, [
+      return runSigningPrompted(sessionHmacKey, [
         'tx', 'edit-policy',
         '--destination', typed.destination,
         '--policy-id', typed.policyId,
         '--signature', typed.signature,
         '--apply-on', typed.applyOn,
         '--broadcast',
-      ], preProofInputs);
+      ], buildPolicyQueue(typed));
     }
     case 'wallet_tx_delete_policy': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
