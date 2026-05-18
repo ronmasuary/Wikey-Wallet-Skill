@@ -260,6 +260,65 @@ export function buildPolicyQueue(opts: {
   return steps;
 }
 
+// ─── edit-helpers prompt queue (runSigningPrompted) ──────────────────────────
+
+export function buildEditHelpersQueue(
+  addHelpers: string[],
+  removeHelpers: string[],
+  threshold: number,
+): (all: string) => PromptStep[] {
+  return (all: string): PromptStep[] => {
+    const steps: PromptStep[] = [];
+
+    if (addHelpers.length === 0) {
+      steps.push({ match: 'Would you like to add a helper?', respond: () => 'n\n' });
+    } else {
+      steps.push({ match: 'Would you like to add a helper?', respond: () => 'y\n' });
+      for (let i = 0; i < addHelpers.length; i++) {
+        steps.push({ match: 'Enter helper address or username', respond: () => addHelpers[i] + '\n' });
+        const isLast = i === addHelpers.length - 1;
+        steps.push({
+          match: 'Would you like to add another helper?',
+          respond: () => (isLast ? 'n\n' : 'y\n'),
+        });
+      }
+    }
+
+    if (removeHelpers.length === 0) {
+      steps.push({ match: 'Would you like to remove a helper?', respond: () => 'n\n' });
+    } else {
+      steps.push({ match: 'Would you like to remove a helper?', respond: () => 'y\n' });
+      for (let i = 0; i < removeHelpers.length; i++) {
+        const target = removeHelpers[i];
+        steps.push({
+          match: 'Enter the number of the helper to remove',
+          respond: () => {
+            const matches = [...all.matchAll(/^\s*(\d+)[.)]\s*(.+)$/gm)];
+            const list = matches.map(m => m[2].trim());
+            const idx = list.findIndex(h => h.toLowerCase().includes(target.toLowerCase()));
+            if (idx === -1) {
+              throw new Error(`helper not found in list: "${target}". Available: ${list.join(', ')}`);
+            }
+            return (idx + 1).toString() + '\n';
+          },
+        });
+        const isLast = i === removeHelpers.length - 1;
+        steps.push({
+          match: 'Would you like to remove another helper?',
+          respond: () => (isLast ? 'n\n' : 'y\n'),
+        });
+      }
+    }
+
+    steps.push({
+      match: 'Enter threshold (number of helpers required,',
+      respond: () => threshold.toString() + '\n',
+    });
+
+    return steps;
+  };
+}
+
 // ─── edit-helpers signing runner (prompt-driven state machine) ────────────────
 
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -1066,7 +1125,11 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { addHelpers = [], removeHelpers = [], threshold } =
         input as { addHelpers?: string[]; removeHelpers?: string[]; threshold: number };
-      return runSigningEditHelpers(sessionHmacKey, addHelpers, removeHelpers, threshold);
+      return runSigningPrompted(
+        sessionHmacKey,
+        ['tx', 'edit-helpers', '--broadcast'],
+        buildEditHelpersQueue(addHelpers, removeHelpers, threshold),
+      );
     }
     case 'wallet_notification_configure': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
