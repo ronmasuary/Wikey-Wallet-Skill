@@ -100,55 +100,6 @@ async function runQuery(args: string[]): Promise<string> {
   }
 }
 
-// ─── Signing runner (simple + interactive-with-preProofInputs) ───────────────
-
-async function runSigning(
-  hmacKey: string,
-  args: string[],
-  preProofInputs: string[] = [],
-): Promise<string> {
-  const child = spawn('wallet-cli', args, { stdio: ['pipe', 'pipe', 'pipe'] });
-  const inner = new Promise<string>((resolve, reject) => {
-    let stderrBuf = '', stdout = '', proofSent = false;
-
-    for (const line of preProofInputs)
-      child.stdin.write(line.endsWith('\n') ? line : line + '\n');
-
-    child.stderr.on('data', async (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
-      if (proofSent) return;
-      const req = parseSignRequest(stderrBuf);
-      if (!req) return;
-      proofSent = true;
-      try {
-        const proof = await computeProof(hmacKey, req.unsignedData, req.signingPubKey);
-        child.stdin.write(proof + '\n');
-        child.stdin.end();
-      } catch (e) {
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-        reject(e as Error);
-      }
-    });
-
-    child.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
-
-    child.on('close', (code: number | null) => {
-      if (proofSent && code !== 0) return; // proof already rejected; skip double-reject
-      if (code === 0) { resolve(stdout.trim()); return; }
-      let detail = stderrBuf.slice(-500);
-      try {
-        const j = JSON.parse(stdout.trim()) as Record<string, unknown>;
-        const e = j?.error as Record<string, unknown> | undefined;
-        detail = (e?.message as string) ?? (j?.message as string) ?? detail;
-      } catch { /* use stderrBuf */ }
-      reject(new Error(`wallet-cli exit ${code}: ${detail}`));
-    });
-
-    child.on('error', (e: Error) => reject(e));
-  });
-  return withKillTimeout(60_000, 'runSigning', child, inner);
-}
-
 // ─── Profile helpers ──────────────────────────────────────────────────────────
 
 export function extractUsernameFromProfile(raw: string): string {
@@ -190,51 +141,14 @@ async function runHmacRotation(currentHmacKey: string): Promise<{ newHmacKey: st
   }
 }
 
-// ─── Policy stdin builder ─────────────────────────────────────────────────────
+// ─── Policy types ─────────────────────────────────────────────────────────────
 
-interface PolicyCondition {
+export interface PolicyCondition {
   type: string;
   votingQty?: number;
   minAmount?: number;
   maxAmount?: number;
   symbols?: string[];
-}
-
-function buildPolicyStdinInputs(opts: {
-  applyOn: string;
-  conditions: PolicyCondition[];
-  name?: string;
-  description?: string;
-}): string[] {
-  const classes = opts.applyOn.split(',').map(s => s.trim().toLowerCase());
-  const onlyTx = classes.length === 1 && classes[0] === 'transaction';
-
-  const menuMap: Record<string, number> = { voting: 1 };
-  if (onlyTx) { menuMap['amount'] = 2; menuMap['symbols'] = 3; }
-
-  const selected = opts.conditions
-    .map(c => ({ c, idx: menuMap[c.type.toLowerCase()] }))
-    .filter(x => x.idx !== undefined)
-    .sort((a, b) => a.idx - b.idx);
-
-  const lines: string[] = [selected.map(x => x.idx).join(',') + '\n'];
-
-  for (const { c } of selected) {
-    const t = c.type.toLowerCase();
-    if (t === 'voting') {
-      lines.push((c.votingQty ?? 0).toString() + '\n');
-    } else if (t === 'amount') {
-      lines.push((c.minAmount ?? 0).toString() + '\n');
-      lines.push((c.maxAmount ?? 0).toString() + '\n');
-    } else if (t === 'symbols') {
-      lines.push((c.symbols ?? []).join(',') + '\n');
-    }
-  }
-
-  // wallet-cli always prompts for name/description regardless of applyOn
-  lines.push((opts.name ?? '') + '\n');
-  lines.push((opts.description ?? '') + '\n');
-  return lines;
 }
 
 // ─── Policy prompt queue (runSigningPrompted) ────────────────────────────────
@@ -336,11 +250,9 @@ export function buildEditHelpersQueue(
   };
 }
 
-// ─── edit-helpers signing runner (prompt-driven state machine) ────────────────
+// ─── runSigningPrompted: prompt-driven signing runner (shared core) ───────────
 
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
-
-// ─── runSigningPrompted: prompt-driven signing runner (shared core) ───────────
 
 export type PromptStep = { match: string; respond: () => string };
 
@@ -462,124 +374,6 @@ export async function runSigningPrompted(
     });
 
     child.on('error', (e: Error) => fail(e));
-  });
-}
-
-async function runSigningEditHelpers(
-  hmacKey: string,
-  addHelpers: string[],
-  removeHelpers: string[],
-  threshold: number,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('wallet-cli', ['tx', 'edit-helpers', '--broadcast'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    let stderrWindow = ''; // resets after each response to avoid re-triggering
-    let allStderr = '';    // full stderr for list parsing and sign-request detection
-    let stdout = '';
-    let proofSent = false;
-    let helperList: string[] = [];
-    let addIdx = 0;
-    let removeIdx = 0;
-
-    const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      reject(new Error(`runSigningEditHelpers timed out after 90s. Last stderr:\n${allStderr.slice(-400)}`));
-    }, 90_000);
-
-    type Phase =
-      | 'wait_add' | 'enter_add' | 'another_add'
-      | 'wait_remove' | 'enter_remove' | 'another_remove'
-      | 'threshold' | 'proof';
-    let phase: Phase = 'wait_add';
-
-    function updateHelperList() {
-      if (helperList.length > 0) return;
-      const matches = [...allStderr.matchAll(/^\s*(\d+)[.)]\s*(.+)$/gm)];
-      if (matches.length > 0) helperList = matches.map(m => m[2].trim());
-    }
-
-    function ends(prompt: string): boolean {
-      return stderrWindow.trimEnd().endsWith(prompt);
-    }
-
-    function respond(s: string, next: Phase) {
-      phase = next;
-      stderrWindow = '';
-      child.stdin.write(s);
-    }
-
-    function handlePrompts() {
-      updateHelperList();
-      if (phase === 'wait_add' && ends('Would you like to add a helper? (y/n):')) {
-        if (addHelpers.length > 0) respond('y\n', 'enter_add');
-        else respond('n\n', 'wait_remove');
-      } else if (phase === 'enter_add' && ends('Enter helper address or username:')) {
-        respond(addHelpers[addIdx++] + '\n', 'another_add');
-      } else if (phase === 'another_add' && ends('Would you like to add another helper? (y/n):')) {
-        if (addIdx < addHelpers.length) respond('y\n', 'enter_add');
-        else respond('n\n', 'wait_remove');
-      } else if (phase === 'wait_remove' && ends('Would you like to remove a helper? (y/n):')) {
-        if (removeHelpers.length > 0) respond('y\n', 'enter_remove');
-        else respond('n\n', 'threshold');
-      } else if (phase === 'enter_remove' && ends('Enter the number of the helper to remove:')) {
-        const target = removeHelpers[removeIdx];
-        const idx = helperList.findIndex(h => h.toLowerCase().includes(target.toLowerCase()));
-        if (idx === -1) {
-          clearTimeout(timer);
-          try { child.kill('SIGTERM'); } catch { /* ignore */ }
-          reject(new Error(`helper not found in list: "${target}". Available: ${helperList.join(', ')}`));
-          return;
-        }
-        respond((idx + 1).toString() + '\n', 'another_remove');
-        removeIdx++;
-      } else if (phase === 'another_remove' && ends('Would you like to remove another helper? (y/n):')) {
-        if (removeIdx < removeHelpers.length) respond('y\n', 'enter_remove');
-        else respond('n\n', 'threshold');
-      } else if (phase === 'threshold' && stderrWindow.includes('Enter threshold (number of helpers required,')) {
-        respond(threshold.toString() + '\n', 'proof');
-      }
-    }
-
-    child.stderr.on('data', async (chunk: Buffer) => {
-      const s = chunk.toString().replace(ANSI_RE, '');
-      stderrWindow += s;
-      allStderr += s;
-      if (proofSent) return;
-      const req = parseSignRequest(allStderr);
-      if (req) {
-        proofSent = true;
-        try {
-          const proof = await computeProof(hmacKey, req.unsignedData, req.signingPubKey);
-          child.stdin.write(proof + '\n');
-          child.stdin.end();
-        } catch (e) {
-          clearTimeout(timer);
-          try { child.kill('SIGTERM'); } catch { /* ignore */ }
-          reject(e as Error);
-        }
-        return;
-      }
-      handlePrompts();
-    });
-
-    child.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
-
-    child.on('close', (code: number | null) => {
-      clearTimeout(timer);
-      if (code === 0) { resolve(stdout.trim()); return; }
-      let detail = allStderr.slice(-500);
-      try {
-        const j = JSON.parse(stdout.trim()) as Record<string, unknown>;
-        const e = j?.error as Record<string, unknown> | undefined;
-        detail = (e?.message as string) ?? (j?.message as string) ?? detail;
-      } catch { /* use allStderr */ }
-      reject(new Error(`wallet-cli exit ${code}: ${detail}`));
-    });
-
-    child.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
   });
 }
 
@@ -1205,7 +999,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
 
 export default {
   name: 'wikey-wallet-skill',
-  version: '2.0.0',
+  version: '2.1.4',
   tools,
   execute,
   systemPrompt: `

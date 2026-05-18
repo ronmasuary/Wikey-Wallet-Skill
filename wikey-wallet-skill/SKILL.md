@@ -364,9 +364,9 @@ Menu: `1` = Voting, `2` = Amount, `3` = Symbols.
 |---|---|
 | `Your selection:` | comma-separated indices, e.g. `1` or `1,2` or `2,3` or `1,2,3` |
 | *(if Voting)* `Enter voting quantity (percentage, 0-100):` | e.g. `100` |
-| *(if Amount)* `Enter min amount:` | e.g. `0` |
-| *(if Amount)* `Enter max amount:` | e.g. `1000` |
-| *(if Symbols)* `Enter symbols (comma-separated):` | e.g. `BTC,ETH` |
+| *(if Amount)* `Enter minimum amount (>= 0):` | e.g. `0` |
+| *(if Amount)* `Enter maximum amount (>= <min>):` | e.g. `1000` |
+| *(if Symbols)* `Enter symbols (comma-separated, e.g., BTC,ETH,SOL):` | e.g. `BTC,ETH` |
 | `Enter policy name (optional, press Enter to skip):` | name or empty |
 | `Enter policy description (optional, press Enter to skip):` | description or empty |
 
@@ -576,7 +576,9 @@ wallet-cli tx delete-user --destination SAFE_ADDR --user-id UUID --signature SIG
 ```bash
 wallet-cli tx vote --destination SAFE_ADDR --vote YES --signature SIG --broadcast
 ```
-Vote values: `YES`, `NO`, `ABSTAIN`.
+Vote values: `YES`, `NO`.
+
+wallet-cli prompts `Add another vote entry? (y/n):` after the first vote — the skill answers `n` automatically.
 
 ### `tx create-transaction` — move assets out of a safe
 
@@ -606,8 +608,10 @@ Use `wallet-cli query assets` to look up `contractAddress`, `smallCoin`, and `ch
 
 ### `tx request-recovery`
 ```bash
-wallet-cli tx request-recovery --broadcast
+wallet-cli tx request-recovery --username ORIGINAL_USERNAME --broadcast
 ```
+wallet-cli **requires** `--username` (the original account being recovered). The skill accepts either `username` directly, or `oldAddress` — when only `oldAddress` is given the skill resolves the username via `query profile` (key `name`).
+
 Used for two scenarios:
 - **User lost their key** — agent drives recovery on behalf of the user
 - **Agent lost its own key** — agent recovers its own account (see Self-Recovery in Account Recovery section)

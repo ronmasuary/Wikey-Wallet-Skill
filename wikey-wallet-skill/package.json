@@ -1,6 +1,14 @@
 {
   "name": "wikey-wallet-skill",
+  "version": "2.1.4",
   "type": "module",
-  "scripts": { "build": "tsc" },
-  "devDependencies": { "typescript": "^5", "@types/node": "^22" }
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit && node --test --import tsx 'src/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^22",
+    "tsx": "^4"
+  }
 }
