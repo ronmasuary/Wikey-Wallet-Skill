@@ -752,7 +752,7 @@ const tools = [
       type: 'object',
       properties: {
         destination: { type: 'string', description: 'Safe address (omnistar1...)' },
-        vote: { type: 'string', enum: ['YES', 'NO', 'ABSTAIN'] },
+        vote: { type: 'string', enum: ['YES', 'NO'] },
         signature: { type: 'string', description: 'Omnistar tx hash of the object being voted on' },
       },
       required: ['destination', 'vote', 'signature'],
@@ -1058,13 +1058,17 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { destination, vote, signature } =
         input as { destination: string; vote: string; signature: string };
-      return runSigning(sessionHmacKey, [
-        'tx', 'vote',
-        '--destination', destination,
-        '--vote', vote,
-        '--signature', signature,
-        '--broadcast',
-      ]);
+      return runSigningPrompted(
+        sessionHmacKey,
+        [
+          'tx', 'vote',
+          '--destination', destination,
+          '--vote', vote,
+          '--signature', signature,
+          '--broadcast',
+        ],
+        [{ match: 'Add another vote entry?', respond: () => 'n\n' }],
+      );
     }
     case 'wallet_tx_request_recovery': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
