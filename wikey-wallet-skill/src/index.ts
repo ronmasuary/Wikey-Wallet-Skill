@@ -6,6 +6,14 @@ import { promisify } from 'node:util';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
+import {
+  parseProfile,
+  extractGroupsFromProfile,
+  extractUsersFromProfile,
+  resolveCreateUserTarget,
+  resolveDeleteUserTarget,
+} from './userResolver.js';
+
 const execFile = promisify(execFileCb);
 const nonceFile = () => path.join(process.cwd(), '.ssp-nonce');
 
@@ -667,6 +675,32 @@ const tools = [
     },
   },
   {
+    name: 'wallet_tx_create_user',
+    description: 'Add a user to a SAFE\'s group. `destination` MUST be a safe address — users are added to a safe\'s groups, NEVER to a profile\'s groups (do not pass the agent\'s own profile address). `user` MUST be an `omnistar1…` address — usernames are not accepted. `group` is OPTIONAL and MUST be a group ID (literal `Primary` or a UUID from the safe\'s profile), NEVER a group name. If `group` is omitted and the safe has exactly one group, the skill uses it; if ambiguous, the skill errors with the valid id (name) pairs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        destination: { type: 'string', description: 'SAFE address (omnistar1...). NEVER the agent\'s own profile address — users go to safe groups only.' },
+        user: { type: 'string', description: 'omnistar1... address of the new user (not a username).' },
+        group: { type: 'string', description: 'Group ID — literal `Primary` or a UUID from the safe\'s profile. NEVER a group name. Required only if safe has >1 group.' },
+      },
+      required: ['destination', 'user'],
+    },
+  },
+  {
+    name: 'wallet_tx_delete_user',
+    description: 'Remove a user from a SAFE\'s group. `destination` MUST be a safe address (same constraint as create — never a profile address). `user` MUST be an `omnistar1…` address; the skill resolves the on-chain userId + SIGNATURE from the safe\'s profile. `group` is OPTIONAL and MUST be a group ID (`Primary` literal or UUID), NEVER a name — required only if the user appears in >1 group.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        destination: { type: 'string', description: 'SAFE address (omnistar1...). Same constraint as create — users live in safe groups, not profile groups.' },
+        user: { type: 'string', description: 'omnistar1... address of the user to remove.' },
+        group: { type: 'string', description: 'Group ID — `Primary` literal or UUID. NEVER a name. Required only if user appears in >1 group.' },
+      },
+      required: ['destination', 'user'],
+    },
+  },
+  {
     name: 'wallet_tx_edit_helpers',
     description: 'Add/remove recovery helpers and set threshold. Helpers have no safe permissions — recovery only.',
     inputSchema: {
@@ -956,6 +990,45 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
         '--broadcast',
       ], []);
     }
+    case 'wallet_tx_create_user': {
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { destination, user, group } = input as { destination: string; user: string; group?: string };
+      if (!user.startsWith('omnistar1')) throw new Error('user must be an omnistar1… address');
+      const profile = parseProfile(await runQuery(['query', 'profile', '--address', destination]));
+      const parentGroup = resolveCreateUserTarget({
+        destination,
+        group,
+        groups: extractGroupsFromProfile(profile),
+      });
+      return runSigningPrompted(sessionHmacKey, [
+        'tx', 'create-user',
+        '--destination', destination,
+        '--public-key', user,
+        '--parent-group', parentGroup,
+        '--broadcast',
+      ], []);
+    }
+    case 'wallet_tx_delete_user': {
+      if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
+      const { destination, user, group } = input as { destination: string; user: string; group?: string };
+      if (!user.startsWith('omnistar1')) throw new Error('user must be an omnistar1… address');
+      const profile = parseProfile(await runQuery(['query', 'profile', '--address', destination]));
+      const { userId, signature, parentGroup } = resolveDeleteUserTarget({
+        destination,
+        user,
+        group,
+        users: extractUsersFromProfile(profile),
+        groups: extractGroupsFromProfile(profile),
+      });
+      return runSigningPrompted(sessionHmacKey, [
+        'tx', 'delete-user',
+        '--destination', destination,
+        '--user-id', userId,
+        '--signature', signature,
+        '--parent-group', parentGroup,
+        '--broadcast',
+      ], []);
+    }
     case 'wallet_tx_edit_helpers': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { addHelpers = [], removeHelpers = [], threshold } =
@@ -999,7 +1072,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
 
 export default {
   name: 'wikey-wallet-skill',
-  version: '2.1.4',
+  version: '2.2.0',
   tools,
   execute,
   systemPrompt: `
@@ -1022,5 +1095,6 @@ wallet_tx_create_policy / wallet_tx_edit_policy: MIXING RULE — amount and symb
 wallet_tx_delete_policy: soft-delete only — data remains on-chain. No stdin prompts needed.
 wallet_tx_request_recovery: requires the original account's username (wallet-cli --username). Pass 'username' directly when known, or pass 'oldAddress' and the skill resolves the username via query profile. The new signing key must already be active in the SSP session.
 wallet_tx_edit_policy / wallet_tx_delete_policy: policyId and signature come from wallet_profile output (find policy by id field, read its SIGNATURE field).
+wallet_tx_create_user / wallet_tx_delete_user: users are added to a SAFE's groups, NEVER to a profile's groups — \`destination\` must be a safe address (not the agent's own profile). \`user\` must be an \`omnistar1…\` address (usernames are rejected). \`group\` is a group ID (literal \`Primary\` or a UUID from the safe's profile), NEVER a name; omit it when the safe has one group and the skill picks it, or pass an explicit id when ambiguous. The skill resolves the on-chain userId + SIGNATURE for delete by querying the safe's profile — no need to look those up yourself.
   `.trim(),
 };

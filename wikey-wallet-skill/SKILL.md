@@ -564,13 +564,31 @@ wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature
 
 ### `tx create-user`
 ```bash
-wallet-cli tx create-user --destination SAFE_ADDR --public-key omnistar1... --broadcast
+wallet-cli tx create-user --destination SAFE_ADDR --public-key omnistar1... \
+  --parent-group GROUP_ID --broadcast
 ```
+
+**Hard contract (skill-side enforcement + agent must understand):**
+- **Users go to a SAFE's groups, NEVER to a profile's groups.** `--destination` must be the safe address — never an agent's profile address.
+- **`--parent-group` is a group ID, not a name.** Valid values: the literal `Primary` (genesis group, id == name), or a UUID from the safe's profile (`query profile --address SAFE_ADDR` → `groups[].id`). Names are rejected by the skill.
+- **`--public-key` must be an `omnistar1…` address.** Usernames are rejected by wallet-cli.
+
+The skill (`wallet_tx_create_user`) accepts `{destination, user, group?}` — when `group` is omitted and the safe has exactly one group, the skill passes its id; when ambiguous (≥2 groups), the skill errors with the id (name) pairs so the agent can pick.
 
 ### `tx delete-user`
 ```bash
-wallet-cli tx delete-user --destination SAFE_ADDR --user-id UUID --signature SIG --broadcast
+wallet-cli tx delete-user --destination SAFE_ADDR --user-id UUID --signature SIG \
+  --parent-group GROUP_ID --broadcast
 ```
+
+Same contract as `tx create-user`:
+- Users live in **safe** groups, never profile groups — `--destination` is a safe address.
+- `--parent-group` is a group **ID** (`Primary` literal or UUID), never a name.
+- `--user-id` and `--signature` come from the safe's profile (`groups[].users[]` — id + SIGNATURE for that membership).
+
+The skill (`wallet_tx_delete_user`) accepts `{destination, user, group?}` where `user` is the target's `omnistar1…` address; the skill resolves `--user-id` + `--signature` + `--parent-group` from `query profile`. If the same address sits in multiple groups, the skill errors and the agent must pass `group` (an id).
+
+> **`add-group` is upstream-pending in wallet-cli** — no skill tool yet.
 
 ### `tx vote`
 ```bash

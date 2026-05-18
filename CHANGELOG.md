@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-05-18
+
+### Added
+- `wallet_tx_create_user` — add a user to a safe's group. Resolves `--parent-group` from the safe's profile when the safe has one group; rejects group **names** (only the literal `Primary` or a UUID id is accepted); rejects `user` values that aren't an `omnistar1…` address.
+- `wallet_tx_delete_user` — remove a user from a safe's group. Takes the target's `omnistar1…` address and resolves `--user-id`, `--signature`, and `--parent-group` from the safe's profile. Errors when the address appears in multiple groups unless `group` (an id) disambiguates.
+- `src/userResolver.ts` — pure profile-parsing + resolution helpers (`parseProfile`, `extractUsersFromProfile`, `extractGroupsFromProfile`, `resolveCreateUserTarget`, `resolveDeleteUserTarget`) with `node:test` unit coverage.
+
+### Notes
+- Hard contract surfaced in tool descriptions, `SKILL.md`, and the system prompt: users go to a **safe's** groups, never a profile's groups; `group` is a group **ID**, never a name.
+- Both tools use `runSigningPrompted` with an empty queue — same shape as `wallet_tx_delete_policy`, so the stdin-reader-per-prompt issue does not apply.
+- `add-group` is upstream-pending in wallet-cli and out of scope for this release.
+
 ## [2.1.4] - 2026-05-18
 
 ### Fixed
