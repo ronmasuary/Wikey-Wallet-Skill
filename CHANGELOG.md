@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.4] - 2026-05-18
+
+### Fixed
+- `wallet_tx_create_policy` / `wallet_tx_edit_policy`: 60s hang. wallet-cli opens a new readline per prompt; the old `runSigning` wrote all `preProofInputs` upfront and only the first line was readable. Replaced with prompt-driven state machine (`runSigningPrompted` + `buildPolicyQueue`).
+- `wallet_tx_vote`: missing answer to wallet-cli's `Add another vote entry? (y/n):` prompt caused a 60s hang. Skill now auto-answers `n`.
+- `wallet_tx_request_recovery`: wallet-cli requires `--username` but the tool never passed it. Schema now accepts `username` or `oldAddress` (resolves via `query profile`, reads `.data.profile.name`).
+- `wallet_tx_vote` tool description: vote enum reduced to `YES`/`NO` (wallet-cli does not accept `ABSTAIN`).
+
+### Changed
+- Consolidated `runSigning` and `runSigningEditHelpers` into a single `runSigningPrompted` runner with per-prompt watchdog (30s default) and overall cap (120s).
+- Bumped skill version to 2.1.4 (`src/index.ts` default export and `package.json`).
+
+### Added
+- Pure-function unit tests via `node:test` + `tsx` (`buildPolicyQueue`, `buildEditHelpersQueue`, `extractUsernameFromProfile`).
+- `npm test` script.
+- GitHub Actions CI workflow running build + tests on PRs and pushes to `beta`/`main`.
+
+### Docs
+- `SKILL.md`: corrected `create-policy` / `edit-policy` prompt strings, fixed `tx vote` valid values, documented `tx request-recovery` `--username` requirement and skill-side auto-resolution.
+
 ## [2.1.1] - 2026-05-17
 
 ### Fixed

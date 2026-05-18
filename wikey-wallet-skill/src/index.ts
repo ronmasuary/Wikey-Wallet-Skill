@@ -100,53 +100,21 @@ async function runQuery(args: string[]): Promise<string> {
   }
 }
 
-// ─── Signing runner (simple + interactive-with-preProofInputs) ───────────────
+// ─── Profile helpers ──────────────────────────────────────────────────────────
 
-async function runSigning(
-  hmacKey: string,
-  args: string[],
-  preProofInputs: string[] = [],
-): Promise<string> {
-  const child = spawn('wallet-cli', args, { stdio: ['pipe', 'pipe', 'pipe'] });
-  const inner = new Promise<string>((resolve, reject) => {
-    let stderrBuf = '', stdout = '', proofSent = false;
-
-    for (const line of preProofInputs)
-      child.stdin.write(line.endsWith('\n') ? line : line + '\n');
-
-    child.stderr.on('data', async (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
-      if (proofSent) return;
-      const req = parseSignRequest(stderrBuf);
-      if (!req) return;
-      proofSent = true;
-      try {
-        const proof = await computeProof(hmacKey, req.unsignedData, req.signingPubKey);
-        child.stdin.write(proof + '\n');
-        child.stdin.end();
-      } catch (e) {
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-        reject(e as Error);
-      }
-    });
-
-    child.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
-
-    child.on('close', (code: number | null) => {
-      if (proofSent && code !== 0) return; // proof already rejected; skip double-reject
-      if (code === 0) { resolve(stdout.trim()); return; }
-      let detail = stderrBuf.slice(-500);
-      try {
-        const j = JSON.parse(stdout.trim()) as Record<string, unknown>;
-        const e = j?.error as Record<string, unknown> | undefined;
-        detail = (e?.message as string) ?? (j?.message as string) ?? detail;
-      } catch { /* use stderrBuf */ }
-      reject(new Error(`wallet-cli exit ${code}: ${detail}`));
-    });
-
-    child.on('error', (e: Error) => reject(e));
-  });
-  return withKillTimeout(60_000, 'runSigning', child, inner);
+export function extractUsernameFromProfile(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`failed to parse profile JSON. Raw tail: ${raw.slice(-200)}`);
+  }
+  const root = parsed as { data?: { profile?: { name?: unknown } }; profile?: { name?: unknown } };
+  const name = root?.data?.profile?.name ?? root?.profile?.name;
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new Error('profile.name not found in query profile response');
+  }
+  return name;
 }
 
 // ─── HMAC rotation ────────────────────────────────────────────────────────────
@@ -173,9 +141,9 @@ async function runHmacRotation(currentHmacKey: string): Promise<{ newHmacKey: st
   }
 }
 
-// ─── Policy stdin builder ─────────────────────────────────────────────────────
+// ─── Policy types ─────────────────────────────────────────────────────────────
 
-interface PolicyCondition {
+export interface PolicyCondition {
   type: string;
   votingQty?: number;
   minAmount?: number;
@@ -183,12 +151,14 @@ interface PolicyCondition {
   symbols?: string[];
 }
 
-function buildPolicyStdinInputs(opts: {
+// ─── Policy prompt queue (runSigningPrompted) ────────────────────────────────
+
+export function buildPolicyQueue(opts: {
   applyOn: string;
   conditions: PolicyCondition[];
   name?: string;
   description?: string;
-}): string[] {
+}): PromptStep[] {
   const classes = opts.applyOn.split(',').map(s => s.trim().toLowerCase());
   const onlyTx = classes.length === 1 && classes[0] === 'transaction';
 
@@ -200,145 +170,210 @@ function buildPolicyStdinInputs(opts: {
     .filter(x => x.idx !== undefined)
     .sort((a, b) => a.idx - b.idx);
 
-  const lines: string[] = [selected.map(x => x.idx).join(',') + '\n'];
+  const steps: PromptStep[] = [
+    { match: 'Your selection', respond: () => selected.map(x => x.idx).join(',') + '\n' },
+  ];
 
   for (const { c } of selected) {
     const t = c.type.toLowerCase();
     if (t === 'voting') {
-      lines.push((c.votingQty ?? 0).toString() + '\n');
+      steps.push({ match: 'Enter voting quantity', respond: () => (c.votingQty ?? 0).toString() + '\n' });
     } else if (t === 'amount') {
-      lines.push((c.minAmount ?? 0).toString() + '\n');
-      lines.push((c.maxAmount ?? 0).toString() + '\n');
+      steps.push({ match: 'Enter minimum amount', respond: () => (c.minAmount ?? 0).toString() + '\n' });
+      steps.push({ match: 'Enter maximum amount', respond: () => (c.maxAmount ?? 0).toString() + '\n' });
     } else if (t === 'symbols') {
-      lines.push((c.symbols ?? []).join(',') + '\n');
+      steps.push({ match: 'Enter symbols (comma-separated', respond: () => (c.symbols ?? []).join(',') + '\n' });
     }
   }
 
-  // wallet-cli always prompts for name/description regardless of applyOn
-  lines.push((opts.name ?? '') + '\n');
-  lines.push((opts.description ?? '') + '\n');
-  return lines;
+  steps.push({ match: 'Enter policy name (optional', respond: () => (opts.name ?? '') + '\n' });
+  steps.push({ match: 'Enter policy description (optional', respond: () => (opts.description ?? '') + '\n' });
+  return steps;
 }
 
-// ─── edit-helpers signing runner (prompt-driven state machine) ────────────────
+// ─── edit-helpers prompt queue (runSigningPrompted) ──────────────────────────
 
-const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
-
-async function runSigningEditHelpers(
-  hmacKey: string,
+export function buildEditHelpersQueue(
   addHelpers: string[],
   removeHelpers: string[],
   threshold: number,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('wallet-cli', ['tx', 'edit-helpers', '--broadcast'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+): (all: string) => PromptStep[] {
+  return (all: string): PromptStep[] => {
+    const steps: PromptStep[] = [];
 
-    let stderrWindow = ''; // resets after each response to avoid re-triggering
-    let allStderr = '';    // full stderr for list parsing and sign-request detection
-    let stdout = '';
-    let proofSent = false;
-    let helperList: string[] = [];
-    let addIdx = 0;
-    let removeIdx = 0;
-
-    const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      reject(new Error(`runSigningEditHelpers timed out after 90s. Last stderr:\n${allStderr.slice(-400)}`));
-    }, 90_000);
-
-    type Phase =
-      | 'wait_add' | 'enter_add' | 'another_add'
-      | 'wait_remove' | 'enter_remove' | 'another_remove'
-      | 'threshold' | 'proof';
-    let phase: Phase = 'wait_add';
-
-    function updateHelperList() {
-      if (helperList.length > 0) return;
-      const matches = [...allStderr.matchAll(/^\s*(\d+)[.)]\s*(.+)$/gm)];
-      if (matches.length > 0) helperList = matches.map(m => m[2].trim());
-    }
-
-    function ends(prompt: string): boolean {
-      return stderrWindow.trimEnd().endsWith(prompt);
-    }
-
-    function respond(s: string, next: Phase) {
-      phase = next;
-      stderrWindow = '';
-      child.stdin.write(s);
-    }
-
-    function handlePrompts() {
-      updateHelperList();
-      if (phase === 'wait_add' && ends('Would you like to add a helper? (y/n):')) {
-        if (addHelpers.length > 0) respond('y\n', 'enter_add');
-        else respond('n\n', 'wait_remove');
-      } else if (phase === 'enter_add' && ends('Enter helper address or username:')) {
-        respond(addHelpers[addIdx++] + '\n', 'another_add');
-      } else if (phase === 'another_add' && ends('Would you like to add another helper? (y/n):')) {
-        if (addIdx < addHelpers.length) respond('y\n', 'enter_add');
-        else respond('n\n', 'wait_remove');
-      } else if (phase === 'wait_remove' && ends('Would you like to remove a helper? (y/n):')) {
-        if (removeHelpers.length > 0) respond('y\n', 'enter_remove');
-        else respond('n\n', 'threshold');
-      } else if (phase === 'enter_remove' && ends('Enter the number of the helper to remove:')) {
-        const target = removeHelpers[removeIdx];
-        const idx = helperList.findIndex(h => h.toLowerCase().includes(target.toLowerCase()));
-        if (idx === -1) {
-          clearTimeout(timer);
-          try { child.kill('SIGTERM'); } catch { /* ignore */ }
-          reject(new Error(`helper not found in list: "${target}". Available: ${helperList.join(', ')}`));
-          return;
-        }
-        respond((idx + 1).toString() + '\n', 'another_remove');
-        removeIdx++;
-      } else if (phase === 'another_remove' && ends('Would you like to remove another helper? (y/n):')) {
-        if (removeIdx < removeHelpers.length) respond('y\n', 'enter_remove');
-        else respond('n\n', 'threshold');
-      } else if (phase === 'threshold' && stderrWindow.includes('Enter threshold (number of helpers required,')) {
-        respond(threshold.toString() + '\n', 'proof');
+    if (addHelpers.length === 0) {
+      steps.push({ match: 'Would you like to add a helper?', respond: () => 'n\n' });
+    } else {
+      steps.push({ match: 'Would you like to add a helper?', respond: () => 'y\n' });
+      for (let i = 0; i < addHelpers.length; i++) {
+        steps.push({ match: 'Enter helper address or username', respond: () => addHelpers[i] + '\n' });
+        const isLast = i === addHelpers.length - 1;
+        steps.push({
+          match: 'Would you like to add another helper?',
+          respond: () => (isLast ? 'n\n' : 'y\n'),
+        });
       }
     }
+
+    if (removeHelpers.length === 0) {
+      steps.push({ match: 'Would you like to remove a helper?', respond: () => 'n\n' });
+    } else {
+      steps.push({ match: 'Would you like to remove a helper?', respond: () => 'y\n' });
+      for (let i = 0; i < removeHelpers.length; i++) {
+        const target = removeHelpers[i];
+        steps.push({
+          match: 'Enter the number of the helper to remove',
+          respond: () => {
+            const matches = [...all.matchAll(/^\s*(\d+)[.)]\s*(.+)$/gm)];
+            const list = matches.map(m => m[2].trim());
+            const idx = list.findIndex(h => h.toLowerCase().includes(target.toLowerCase()));
+            if (idx === -1) {
+              throw new Error(`helper not found in list: "${target}". Available: ${list.join(', ')}`);
+            }
+            return (idx + 1).toString() + '\n';
+          },
+        });
+        const isLast = i === removeHelpers.length - 1;
+        steps.push({
+          match: 'Would you like to remove another helper?',
+          respond: () => (isLast ? 'n\n' : 'y\n'),
+        });
+      }
+    }
+
+    steps.push({
+      match: 'Enter threshold (number of helpers required,',
+      respond: () => threshold.toString() + '\n',
+    });
+
+    return steps;
+  };
+}
+
+// ─── runSigningPrompted: prompt-driven signing runner (shared core) ───────────
+
+const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+export type PromptStep = { match: string; respond: () => string };
+
+export interface PromptedOpts {
+  perPromptMs?: number;
+  overallMs?: number;
+}
+
+export async function runSigningPrompted(
+  hmacKey: string,
+  args: string[],
+  queue: PromptStep[] | ((all: string) => PromptStep[]),
+  opts: PromptedOpts = {},
+): Promise<string> {
+  const perPromptMs = opts.perPromptMs ?? 30_000;
+  const overallMs = opts.overallMs ?? 120_000;
+  const isFn = typeof queue === 'function';
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('wallet-cli', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    let stderrWindow = '';
+    let allStderr = '';
+    let stdout = '';
+    let proofSent = false;
+    let queueIdx = 0;
+    let settled = false;
+    let promptTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function settle(fn: () => void) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimer);
+      if (promptTimer) clearTimeout(promptTimer);
+      fn();
+    }
+
+    function fail(err: Error) {
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      settle(() => reject(err));
+    }
+
+    function getStep(): PromptStep | null {
+      const steps = isFn ? (queue as (all: string) => PromptStep[])(allStderr) : (queue as PromptStep[]);
+      return steps[queueIdx] ?? null;
+    }
+
+    function armPromptTimer() {
+      if (promptTimer) clearTimeout(promptTimer);
+      const step = getStep();
+      if (!step) { promptTimer = null; return; }
+      promptTimer = setTimeout(() => {
+        fail(new Error(`runSigningPrompted stuck waiting: "${step.match}". Last stderr:\n${allStderr.slice(-400)}`));
+      }, perPromptMs);
+    }
+
+    function respond(step: PromptStep) {
+      let payload: string;
+      try {
+        payload = step.respond();
+      } catch (e) {
+        fail(e as Error);
+        return;
+      }
+      stderrWindow = '';
+      child.stdin.write(payload);
+      queueIdx++;
+      armPromptTimer();
+    }
+
+    const overallTimer = setTimeout(() => {
+      fail(new Error(`runSigningPrompted overall timeout after ${overallMs / 1000}s. Last stderr:\n${allStderr.slice(-400)}`));
+    }, overallMs);
+
+    armPromptTimer();
 
     child.stderr.on('data', async (chunk: Buffer) => {
       const s = chunk.toString().replace(ANSI_RE, '');
       stderrWindow += s;
       allStderr += s;
-      if (proofSent) return;
-      const req = parseSignRequest(allStderr);
-      if (req) {
-        proofSent = true;
-        try {
-          const proof = await computeProof(hmacKey, req.unsignedData, req.signingPubKey);
-          child.stdin.write(proof + '\n');
-          child.stdin.end();
-        } catch (e) {
-          clearTimeout(timer);
-          try { child.kill('SIGTERM'); } catch { /* ignore */ }
-          reject(e as Error);
+      if (settled) return;
+
+      if (!proofSent) {
+        const req = parseSignRequest(allStderr);
+        if (req) {
+          proofSent = true;
+          if (promptTimer) { clearTimeout(promptTimer); promptTimer = null; }
+          try {
+            const proof = await computeProof(hmacKey, req.unsignedData, req.signingPubKey);
+            child.stdin.write(proof + '\n');
+            child.stdin.end();
+          } catch (e) {
+            fail(e as Error);
+          }
+          return;
         }
-        return;
       }
-      handlePrompts();
+
+      while (!settled) {
+        const step = getStep();
+        if (!step) break;
+        if (!stderrWindow.includes(step.match)) break;
+        respond(step);
+      }
     });
 
     child.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
 
     child.on('close', (code: number | null) => {
-      clearTimeout(timer);
-      if (code === 0) { resolve(stdout.trim()); return; }
+      if (settled) return;
+      if (code === 0) { settle(() => resolve(stdout.trim())); return; }
       let detail = allStderr.slice(-500);
       try {
         const j = JSON.parse(stdout.trim()) as Record<string, unknown>;
         const e = j?.error as Record<string, unknown> | undefined;
         detail = (e?.message as string) ?? (j?.message as string) ?? detail;
       } catch { /* use allStderr */ }
-      reject(new Error(`wallet-cli exit ${code}: ${detail}`));
+      settle(() => reject(new Error(`wallet-cli exit ${code}: ${detail}`)));
     });
 
-    child.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    child.on('error', (e: Error) => fail(e));
   });
 }
 
@@ -528,7 +563,7 @@ const tools = [
       type: 'object',
       properties: {
         destination: { type: 'string', description: 'Safe address (omnistar1...)' },
-        vote: { type: 'string', enum: ['YES', 'NO', 'ABSTAIN'] },
+        vote: { type: 'string', enum: ['YES', 'NO'] },
         signature: { type: 'string', description: 'Omnistar tx hash of the object being voted on' },
       },
       required: ['destination', 'vote', 'signature'],
@@ -536,8 +571,15 @@ const tools = [
   },
   {
     name: 'wallet_tx_request_recovery',
-    description: 'Request account recovery (signs with new key, references original account). Returns result for helper deeplink construction.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: 'Request account recovery for an existing username. Signs with the new key and references the original account by username (wallet-cli requires --username). Pass `username` directly, or pass `oldAddress` and the skill resolves the username via query profile. Exactly one of the two is required. Returns result for helper deeplink construction.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        username: { type: 'string', description: 'Original account username being recovered' },
+        oldAddress: { type: 'string', description: 'omnistar1... address of the account being recovered; skill resolves the username via query profile' },
+      },
+      required: [],
+    },
   },
   {
     name: 'wallet_tx_approve_recovery',
@@ -778,7 +820,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       const { setDefault } = input as { setDefault?: boolean };
       const args = ['keys', 'create'];
       if (setDefault) args.push('--set-default');
-      return runSigning(sessionHmacKey, args);
+      return runSigningPrompted(sessionHmacKey, args, []);
     }
     // Config tools
     case 'wallet_config_show':
@@ -801,12 +843,12 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
     case 'wallet_tx_create_safe': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { username } = input as { username: string };
-      return runSigning(sessionHmacKey, ['tx', 'create-safe', '--username', username, '--broadcast']);
+      return runSigningPrompted(sessionHmacKey, ['tx', 'create-safe', '--username', username, '--broadcast'], []);
     }
     case 'wallet_tx_send': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { from, to, amount } = input as { from: string; to: string; amount: string };
-      return runSigning(sessionHmacKey, ['tx', 'send', '--from', from, '--to', to, '--amount', amount, '--broadcast']);
+      return runSigningPrompted(sessionHmacKey, ['tx', 'send', '--from', from, '--to', to, '--amount', amount, '--broadcast'], []);
     }
     case 'wallet_tx_create_transaction': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
@@ -828,34 +870,51 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (chain) args.push('--chain', chain);
       if (smallCoin !== undefined) args.push('--small-coin', smallCoin.toString());
       args.push('--broadcast');
-      return runSigning(sessionHmacKey, args);
+      return runSigningPrompted(sessionHmacKey, args, []);
     }
     case 'wallet_tx_vote': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { destination, vote, signature } =
         input as { destination: string; vote: string; signature: string };
-      return runSigning(sessionHmacKey, [
-        'tx', 'vote',
-        '--destination', destination,
-        '--vote', vote,
-        '--signature', signature,
-        '--broadcast',
-      ]);
+      return runSigningPrompted(
+        sessionHmacKey,
+        [
+          'tx', 'vote',
+          '--destination', destination,
+          '--vote', vote,
+          '--signature', signature,
+          '--broadcast',
+        ],
+        [{ match: 'Add another vote entry?', respond: () => 'n\n' }],
+      );
     }
     case 'wallet_tx_request_recovery': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
-      return runSigning(sessionHmacKey, ['tx', 'request-recovery', '--broadcast']);
+      const { username, oldAddress } = input as { username?: string; oldAddress?: string };
+      let resolvedUsername = username;
+      if (!resolvedUsername) {
+        if (!oldAddress) {
+          throw new Error('wallet_tx_request_recovery requires either `username` or `oldAddress`');
+        }
+        const profileRaw = await runQuery(['query', 'profile', '--address', oldAddress]);
+        resolvedUsername = extractUsernameFromProfile(profileRaw);
+      }
+      return runSigningPrompted(
+        sessionHmacKey,
+        ['tx', 'request-recovery', '--username', resolvedUsername, '--broadcast'],
+        [],
+      );
     }
     case 'wallet_tx_approve_recovery': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { oldaccount, newaccount } =
         input as { oldaccount: string; newaccount: string };
-      return runSigning(sessionHmacKey, [
+      return runSigningPrompted(sessionHmacKey, [
         'tx', 'approve-recovery',
         '--oldaccount', oldaccount,
         '--newaccount', newaccount,
         '--broadcast',
-      ]);
+      ], []);
     }
     case 'wallet_tx_create_policy': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
@@ -863,13 +922,12 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
         destination: string; applyOn: string;
         conditions: PolicyCondition[]; name?: string; description?: string;
       };
-      const preProofInputs = buildPolicyStdinInputs(typed);
-      return runSigning(sessionHmacKey, [
+      return runSigningPrompted(sessionHmacKey, [
         'tx', 'create-policy',
         '--destination', typed.destination,
         '--apply-on', typed.applyOn,
         '--broadcast',
-      ], preProofInputs);
+      ], buildPolicyQueue(typed));
     }
     case 'wallet_tx_edit_policy': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
@@ -877,33 +935,36 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
         destination: string; policyId: string; signature: string;
         applyOn: string; conditions: PolicyCondition[]; name?: string; description?: string;
       };
-      const preProofInputs = buildPolicyStdinInputs(typed);
-      return runSigning(sessionHmacKey, [
+      return runSigningPrompted(sessionHmacKey, [
         'tx', 'edit-policy',
         '--destination', typed.destination,
         '--policy-id', typed.policyId,
         '--signature', typed.signature,
         '--apply-on', typed.applyOn,
         '--broadcast',
-      ], preProofInputs);
+      ], buildPolicyQueue(typed));
     }
     case 'wallet_tx_delete_policy': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { destination, policyId, signature } =
         input as { destination: string; policyId: string; signature: string };
-      return runSigning(sessionHmacKey, [
+      return runSigningPrompted(sessionHmacKey, [
         'tx', 'delete-policy',
         '--destination', destination,
         '--policy-id', policyId,
         '--signature', signature,
         '--broadcast',
-      ]);
+      ], []);
     }
     case 'wallet_tx_edit_helpers': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { addHelpers = [], removeHelpers = [], threshold } =
         input as { addHelpers?: string[]; removeHelpers?: string[]; threshold: number };
-      return runSigningEditHelpers(sessionHmacKey, addHelpers, removeHelpers, threshold);
+      return runSigningPrompted(
+        sessionHmacKey,
+        ['tx', 'edit-helpers', '--broadcast'],
+        buildEditHelpersQueue(addHelpers, removeHelpers, threshold),
+      );
     }
     case 'wallet_notification_configure': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
@@ -921,7 +982,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (address) args.push('--address', address);
       if (url) args.push('--url', url);
       args.push('--sign');
-      return runSigning(sessionHmacKey, args);
+      return runSigningPrompted(sessionHmacKey, args, []);
     }
     case 'wallet_hmac_rotate': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
@@ -938,7 +999,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
 
 export default {
   name: 'wikey-wallet-skill',
-  version: '2.1.3',
+  version: '2.1.4',
   tools,
   execute,
   systemPrompt: `
@@ -959,6 +1020,7 @@ wallet_tx_create_transaction: amount must be in smallest units (display value ×
 wallet_tx_vote: signature is the Omnistar tx hash of the object being voted on (SIGNATURE field from snapshot).
 wallet_tx_create_policy / wallet_tx_edit_policy: MIXING RULE — amount and symbols conditions ONLY available when applyOn is exactly "transaction" (single value). Any other value or combination → voting only. Never pass name/description as CLI flags — always supply via the name/description fields. Name/description prompts always appear regardless of applyOn; pass empty string to skip.
 wallet_tx_delete_policy: soft-delete only — data remains on-chain. No stdin prompts needed.
+wallet_tx_request_recovery: requires the original account's username (wallet-cli --username). Pass 'username' directly when known, or pass 'oldAddress' and the skill resolves the username via query profile. The new signing key must already be active in the SSP session.
 wallet_tx_edit_policy / wallet_tx_delete_policy: policyId and signature come from wallet_profile output (find policy by id field, read its SIGNATURE field).
   `.trim(),
 };
