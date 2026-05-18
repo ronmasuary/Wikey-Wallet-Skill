@@ -23,7 +23,7 @@ jobs:
       - name: Stage compiled output
         run: |
           mkdir -p .skill-staging/src
-          cp wikey-wallet-skill/dist/index.js .skill-staging/src/index.js
+          cp wikey-wallet-skill/dist/*.js .skill-staging/src/
           cp wikey-wallet-skill/package.json .skill-staging/
           cp wikey-wallet-skill/SKILL.md .skill-staging/
           cp -r wikey-wallet-skill/assets .skill-staging/
