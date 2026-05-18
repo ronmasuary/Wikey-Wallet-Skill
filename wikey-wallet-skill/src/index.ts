@@ -149,6 +149,23 @@ async function runSigning(
   return withKillTimeout(60_000, 'runSigning', child, inner);
 }
 
+// ─── Profile helpers ──────────────────────────────────────────────────────────
+
+export function extractUsernameFromProfile(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`failed to parse profile JSON. Raw tail: ${raw.slice(-200)}`);
+  }
+  const root = parsed as { data?: { profile?: { name?: unknown } }; profile?: { name?: unknown } };
+  const name = root?.data?.profile?.name ?? root?.profile?.name;
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new Error('profile.name not found in query profile response');
+  }
+  return name;
+}
+
 // ─── HMAC rotation ────────────────────────────────────────────────────────────
 
 async function runHmacRotation(currentHmacKey: string): Promise<{ newHmacKey: string }> {
@@ -760,8 +777,15 @@ const tools = [
   },
   {
     name: 'wallet_tx_request_recovery',
-    description: 'Request account recovery (signs with new key, references original account). Returns result for helper deeplink construction.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: 'Request account recovery for an existing username. Signs with the new key and references the original account by username (wallet-cli requires --username). Pass `username` directly, or pass `oldAddress` and the skill resolves the username via query profile. Exactly one of the two is required. Returns result for helper deeplink construction.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        username: { type: 'string', description: 'Original account username being recovered' },
+        oldAddress: { type: 'string', description: 'omnistar1... address of the account being recovered; skill resolves the username via query profile' },
+      },
+      required: [],
+    },
   },
   {
     name: 'wallet_tx_approve_recovery',
@@ -1072,7 +1096,20 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
     }
     case 'wallet_tx_request_recovery': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
-      return runSigningPrompted(sessionHmacKey, ['tx', 'request-recovery', '--broadcast'], []);
+      const { username, oldAddress } = input as { username?: string; oldAddress?: string };
+      let resolvedUsername = username;
+      if (!resolvedUsername) {
+        if (!oldAddress) {
+          throw new Error('wallet_tx_request_recovery requires either `username` or `oldAddress`');
+        }
+        const profileRaw = await runQuery(['query', 'profile', '--address', oldAddress]);
+        resolvedUsername = extractUsernameFromProfile(profileRaw);
+      }
+      return runSigningPrompted(
+        sessionHmacKey,
+        ['tx', 'request-recovery', '--username', resolvedUsername, '--broadcast'],
+        [],
+      );
     }
     case 'wallet_tx_approve_recovery': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
@@ -1189,6 +1226,7 @@ wallet_tx_create_transaction: amount must be in smallest units (display value ×
 wallet_tx_vote: signature is the Omnistar tx hash of the object being voted on (SIGNATURE field from snapshot).
 wallet_tx_create_policy / wallet_tx_edit_policy: MIXING RULE — amount and symbols conditions ONLY available when applyOn is exactly "transaction" (single value). Any other value or combination → voting only. Never pass name/description as CLI flags — always supply via the name/description fields. Name/description prompts always appear regardless of applyOn; pass empty string to skip.
 wallet_tx_delete_policy: soft-delete only — data remains on-chain. No stdin prompts needed.
+wallet_tx_request_recovery: requires the original account's username (wallet-cli --username). Pass 'username' directly when known, or pass 'oldAddress' and the skill resolves the username via query profile. The new signing key must already be active in the SSP session.
 wallet_tx_edit_policy / wallet_tx_delete_policy: policyId and signature come from wallet_profile output (find policy by id field, read its SIGNATURE field).
   `.trim(),
 };
