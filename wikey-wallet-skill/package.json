@@ -3,7 +3,7 @@
   "version": "2.2.0",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "test": "tsc --noEmit && node --test --import tsx src/*.test.ts"
   },
   "devDependencies": {
