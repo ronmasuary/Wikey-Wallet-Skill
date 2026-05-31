@@ -559,10 +559,12 @@ wallet-cli tx edit-policy --destination ADDR --policy-id POLICY_ID --signature S
 
 ### `tx delete-policy`
 ```bash
-wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature SIG --broadcast
+wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature SIG \
+  --parent-group GROUP_ID --broadcast
 ```
 ⚠️ Soft-delete only. Data remains on-chain. No stdin prompts.
-`POLICY_ID` and `SIG` — from `wallet-cli query profile --address ADDR`.
+
+The skill (`wallet_tx_delete_policy`) now takes `{destination, policyId}`. Find `policyId` via `wallet_snapshot` under `safe.groups[].nestedObjects[]` where `class === 'policy'` (use the `nestedObject.id`). The skill resolves `--signature` **and** `--parent-group` from the snapshot — `--parent-group` defaults to `Primary` in wallet-cli, so policies in non-Primary groups previously got silently mis-targeted; the resolver now supplies the real group. A user id (or any non-policy id) errors with the list of available policy ids; an already-deleted policy id errors "already deleted".
 
 ### `tx create-user`
 ```bash

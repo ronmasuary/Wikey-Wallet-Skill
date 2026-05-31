@@ -15,6 +15,7 @@ import {
   parseSnapshot,
   findSafe,
   resolveUserDeletion,
+  resolvePolicyDeletion,
 } from './snapshotResolver.js';
 
 const execFile = promisify(execFileCb);
@@ -666,15 +667,14 @@ const tools = [
   },
   {
     name: 'wallet_tx_delete_policy',
-    description: 'Soft-delete a policy from a safe. Data remains on-chain. No stdin prompts. policyId and signature come from wallet_profile output.',
+    description: 'Soft-delete a policy from a safe. Data remains on-chain. No stdin prompts. `policyId` is the policy-object id from `wallet_snapshot` (`safe.groups[].nestedObjects[]` where `class === \'policy\'`). The skill resolves `--signature` and `--parent-group` from the snapshot.',
     inputSchema: {
       type: 'object',
       properties: {
         destination: { type: 'string', description: 'Safe address (omnistar1...)' },
-        policyId: { type: 'string', description: 'Policy ID (from wallet_profile output)' },
-        signature: { type: 'string', description: 'On-chain SIGNATURE of the policy (from wallet_profile output)' },
+        policyId: { type: 'string', description: 'Policy-object id from wallet_snapshot (safe.groups[].nestedObjects[] where class === \'policy\').' },
       },
-      required: ['destination', 'policyId', 'signature'],
+      required: ['destination', 'policyId'],
     },
   },
   {
@@ -982,13 +982,16 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
     }
     case 'wallet_tx_delete_policy': {
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
-      const { destination, policyId, signature } =
-        input as { destination: string; policyId: string; signature: string };
+      const { destination, policyId } = input as { destination: string; policyId: string };
+      const snapshot = parseSnapshot(await runQuery(['query', 'snapshot']));
+      const safe = findSafe(snapshot, destination);
+      const { signature, parentGroup } = resolvePolicyDeletion({ destination, policyId, safe });
       return runSigningPrompted(sessionHmacKey, [
         'tx', 'delete-policy',
         '--destination', destination,
         '--policy-id', policyId,
         '--signature', signature,
+        '--parent-group', parentGroup,
         '--broadcast',
       ], []);
     }
@@ -1088,9 +1091,9 @@ wallet_notification_configure returns a token credential in the result JSON. Dis
 wallet_tx_create_transaction: amount must be in smallest units (display value × smallCoin from wallet_assets).
 wallet_tx_vote: signature is the Omnistar tx hash of the object being voted on (SIGNATURE field from snapshot).
 wallet_tx_create_policy / wallet_tx_edit_policy: MIXING RULE — amount and symbols conditions ONLY available when applyOn is exactly "transaction" (single value). Any other value or combination → voting only. Never pass name/description as CLI flags — always supply via the name/description fields. Name/description prompts always appear regardless of applyOn; pass empty string to skip.
-wallet_tx_delete_policy: soft-delete only — data remains on-chain. No stdin prompts needed.
+wallet_tx_delete_policy: soft-delete only — data remains on-chain. No stdin prompts needed. Takes \`{destination, policyId}\` — \`policyId\` is the policy-object id from wallet_snapshot (\`safe.groups[].nestedObjects[]\` where \`class === 'policy'\`). The skill resolves \`--signature\` and \`--parent-group\` from the snapshot (no \`signature\` arg). A user id (or any non-policy id) errors with the list of available policy ids; do not retry with a different tool.
 wallet_tx_request_recovery: requires the original account's username (wallet-cli --username). Pass 'username' directly when known, or pass 'oldAddress' and the skill resolves the username via query profile. The new signing key must already be active in the SSP session.
-wallet_tx_edit_policy / wallet_tx_delete_policy: policyId and signature come from wallet_profile output (find policy by id field, read its SIGNATURE field).
+wallet_tx_edit_policy: policyId and signature come from wallet_profile output (find policy by id field, read its SIGNATURE field).
 wallet_tx_create_user: users are added to a SAFE's groups, NEVER to a profile's groups — \`destination\` must be a safe address (not the agent's own profile). \`user\` must be an \`omnistar1…\` address (usernames are rejected). \`group\` is a group ID (literal \`Primary\` or a UUID from the safe's profile), NEVER a name; omit it when the safe has one group and the skill picks it, or pass an explicit id when ambiguous.
 wallet_tx_delete_user: takes \`{destination, userId}\` — \`userId\` is the user-object id from wallet_snapshot (\`safe.groups[].nestedObjects[]\` where \`class === 'user'\`), NOT an address. The skill resolves \`--signature\` and \`--parent-group\` from the snapshot. A policy id (or any non-user id) errors with the list of available user ids; do not retry with a different tool.
   `.trim(),
