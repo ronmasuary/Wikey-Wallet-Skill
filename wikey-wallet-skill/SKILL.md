@@ -86,6 +86,7 @@ Installs: `signing-server`, `ssp-util` (to `~/.ssp/bin`), and `wallet-cli`
 - Log, write, persist, or transmit the value of `SSP_HMAC_KEY`.
 - Modify, patch, recompile, or replace `wallet-cli` or `ssp-util` in any way (including edits to `node_modules/`, runtime shims, or forked binaries). These are externally-released packages; local changes are invisible to others, get wiped on reinstall, and paper over real problems.
 - **Never use `shell_exec` for any wallet operation** — all wallet operations have dedicated tools. `shell_exec` is not a fallback. Do not pass `hmacKey` to any tool; the skill manages it internally.
+- **Never substitute a different wallet tool to bypass an error.** If a tool fails, quote the error verbatim and ask the user before trying any alternative tool or raw `wallet-cli` invocation. Example anti-pattern: calling `wallet_tx_delete_policy` with a user's id when `wallet_tx_delete_user` errors — this is an unauthorized tool swap, not a workaround. Same for `wallet_tx_delete_user` with a policy id, or any `wallet-cli` shell call outside the dedicated tools.
 
 ### When `wallet-cli` appears broken
 
@@ -95,7 +96,7 @@ Treat the tool as **read-only**. Never edit it to fix a symptom. In order:
 2. **Check inputs.** Wrong address, missing `--broadcast`, wrong asset units (see smallCoin rule), stale `--signature`, `--name` used as a CLI flag instead of stdin, etc.
 3. **Check versions.** Run `wallet-cli --version` and `signing-server --version`. Version drift is a known failure class — report it and stop.
 4. **Check the chain.** RPC reachable? Account funded? Safe validated yet (~30s after broadcast)?
-5. **Stop and report.** Surface the exact command, exact error, and what was already checked — then ask the user.
+5. **Stop and report.** Surface the exact command, exact error, and what was already checked — then ask the user. Do **not** reach for a different tool to route around the failure (see the tool-substitution rule above) — a failing tool is a stop signal, not a prompt to improvise.
 
 ---
 
@@ -190,10 +191,12 @@ Both profile and safe are on-chain safe constructs. The difference is their role
 | What it is | The key's identity safe on-chain | An asset-holding safe the key operates on behalf of |
 | What it holds | Address, pubkey, policies, list of linked safes | Asset balances (BTC/ETH/OST/…), policies, authorized signers |
 | How created | Created together with the safe via `tx create-safe` | Created via `tx create-safe` |
-| How to query | `wallet-cli query profile` | `wallet-cli query snapshot --address SAFE_ADDR` |
+| How to query | `wallet-cli query profile` | `wallet-cli query snapshot` (defaults to configured profile) |
 
 When you want to know **"what can I do / what safes do I control?"** → query the profile.
 When you want to know **"what does this safe hold / what policies govern it?"** → query the safe.
+
+> **`wallet_snapshot` takes a *profile* address** (defaults to the configured user), not a safe address. It returns a `safe[]` list — find the target safe in the list (`safe.address === destination`) rather than passing a safe address. Each safe has `groups[].nestedObjects[]` keyed by class (`user`, `policy`, `group`, `transaction`, `vote`, …); the `object` of each holds its `SIGNATURE` and `parentGroup`.
 
 ### `SIGNATURE` vs. target-chain `transfer_id`
 
@@ -557,10 +560,12 @@ wallet-cli tx edit-policy --destination ADDR --policy-id POLICY_ID --signature S
 
 ### `tx delete-policy`
 ```bash
-wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature SIG --broadcast
+wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature SIG \
+  --parent-group GROUP_ID --broadcast
 ```
 ⚠️ Soft-delete only. Data remains on-chain. No stdin prompts.
-`POLICY_ID` and `SIG` — from `wallet-cli query profile --address ADDR`.
+
+The skill (`wallet_tx_delete_policy`) now takes `{destination, policyId}`. Find `policyId` via `wallet_snapshot` under `safe.groups[].nestedObjects[]` where `class === 'policy'` (use the `nestedObject.id`). The skill resolves `--signature` **and** `--parent-group` from the snapshot — `--parent-group` defaults to `Primary` in wallet-cli, so policies in non-Primary groups previously got silently mis-targeted; the resolver now supplies the real group. A user id (or any non-policy id) errors with the list of available policy ids; an already-deleted policy id errors "already deleted".
 
 ### `tx create-user`
 ```bash
@@ -570,10 +575,10 @@ wallet-cli tx create-user --destination SAFE_ADDR --public-key omnistar1... \
 
 **Hard contract (skill-side enforcement + agent must understand):**
 - **Users go to a SAFE's groups, NEVER to a profile's groups.** `--destination` must be the safe address — never an agent's profile address.
-- **`--parent-group` is a group ID, not a name.** Valid values: the literal `Primary` (genesis group, id == name), or a UUID from the safe's profile (`query profile --address SAFE_ADDR` → `groups[].id`). Names are rejected by the skill.
+- **`--parent-group` is a group ID, not a name.** Valid values: the literal `Primary` (genesis group, id == name), or a UUID from the safe's snapshot (`wallet_snapshot` → find the safe → `groups[].id`). Names are rejected by the skill.
 - **`--public-key` must be an `omnistar1…` address.** Usernames are rejected by wallet-cli.
 
-The skill (`wallet_tx_create_user`) accepts `{destination, user, group?}` — when `group` is omitted and the safe has exactly one group, the skill passes its id; when ambiguous (≥2 groups), the skill errors with the id (name) pairs so the agent can pick.
+The skill (`wallet_tx_create_user`) accepts `{destination, user, group?}` — when `group` is omitted and the safe has exactly one group, the skill passes its id; when ambiguous (≥2 groups), the skill errors with the id (name) pairs so the agent can pick. Groups are read from the profile snapshot, so soft-deleted groups are excluded.
 
 ### `tx delete-user`
 ```bash
@@ -584,9 +589,9 @@ wallet-cli tx delete-user --destination SAFE_ADDR --user-id UUID --signature SIG
 Same contract as `tx create-user`:
 - Users live in **safe** groups, never profile groups — `--destination` is a safe address.
 - `--parent-group` is a group **ID** (`Primary` literal or UUID), never a name.
-- `--user-id` and `--signature` come from the safe's profile (`groups[].users[]` — id + SIGNATURE for that membership).
+- `--user-id` and `--signature` are the per-membership id + SIGNATURE.
 
-The skill (`wallet_tx_delete_user`) accepts `{destination, user, group?}` where `user` is the target's `omnistar1…` address; the skill resolves `--user-id` + `--signature` + `--parent-group` from `query profile`. If the same address sits in multiple groups, the skill errors and the agent must pass `group` (an id).
+The skill (`wallet_tx_delete_user`) now takes `{destination, userId}` — **not an address**. Find `userId` via `wallet_snapshot` under `safe.groups[].nestedObjects[]` where `class === 'user'` (use the `nestedObject.id`). The skill resolves `--signature` and `--parent-group` from the snapshot. A policy id (or any non-user id) errors with the list of available user ids; an already-deleted user id errors "already deleted".
 
 > **`add-group` is upstream-pending in wallet-cli** — no skill tool yet.
 
