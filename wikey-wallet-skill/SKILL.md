@@ -190,10 +190,12 @@ Both profile and safe are on-chain safe constructs. The difference is their role
 | What it is | The key's identity safe on-chain | An asset-holding safe the key operates on behalf of |
 | What it holds | Address, pubkey, policies, list of linked safes | Asset balances (BTC/ETH/OST/…), policies, authorized signers |
 | How created | Created together with the safe via `tx create-safe` | Created via `tx create-safe` |
-| How to query | `wallet-cli query profile` | `wallet-cli query snapshot --address SAFE_ADDR` |
+| How to query | `wallet-cli query profile` | `wallet-cli query snapshot` (defaults to configured profile) |
 
 When you want to know **"what can I do / what safes do I control?"** → query the profile.
 When you want to know **"what does this safe hold / what policies govern it?"** → query the safe.
+
+> **`wallet_snapshot` takes a *profile* address** (defaults to the configured user), not a safe address. It returns a `safe[]` list — find the target safe in the list (`safe.address === destination`) rather than passing a safe address. Each safe has `groups[].nestedObjects[]` keyed by class (`user`, `policy`, `group`, `transaction`, `vote`, …); the `object` of each holds its `SIGNATURE` and `parentGroup`.
 
 ### `SIGNATURE` vs. target-chain `transfer_id`
 
@@ -584,9 +586,9 @@ wallet-cli tx delete-user --destination SAFE_ADDR --user-id UUID --signature SIG
 Same contract as `tx create-user`:
 - Users live in **safe** groups, never profile groups — `--destination` is a safe address.
 - `--parent-group` is a group **ID** (`Primary` literal or UUID), never a name.
-- `--user-id` and `--signature` come from the safe's profile (`groups[].users[]` — id + SIGNATURE for that membership).
+- `--user-id` and `--signature` are the per-membership id + SIGNATURE.
 
-The skill (`wallet_tx_delete_user`) accepts `{destination, user, group?}` where `user` is the target's `omnistar1…` address; the skill resolves `--user-id` + `--signature` + `--parent-group` from `query profile`. If the same address sits in multiple groups, the skill errors and the agent must pass `group` (an id).
+The skill (`wallet_tx_delete_user`) now takes `{destination, userId}` — **not an address**. Find `userId` via `wallet_snapshot` under `safe.groups[].nestedObjects[]` where `class === 'user'` (use the `nestedObject.id`). The skill resolves `--signature` and `--parent-group` from the snapshot. A policy id (or any non-user id) errors with the list of available user ids; an already-deleted user id errors "already deleted".
 
 > **`add-group` is upstream-pending in wallet-cli** — no skill tool yet.
 
