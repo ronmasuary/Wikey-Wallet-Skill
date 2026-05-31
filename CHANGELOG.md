@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **BREAKING — `wallet_tx_delete_user` now takes `{destination, userId}`** instead of `{destination, user, group?}`. `userId` is the user-object id from `wallet_snapshot` (`safe.groups[].nestedObjects[]` where `class === 'user'`), not an `omnistar1…` address. The skill resolves `--signature` and `--parent-group` from the profile snapshot rather than `query profile`. A non-user id errors with the list of available user ids; an already-deleted user id errors "already deleted". Older prompts passing `user`/`group` get a schema-validation error.
+- **BREAKING — `wallet_tx_delete_policy` now takes `{destination, policyId}`** and no longer accepts a `signature` argument. `policyId` is the policy-object id from `wallet_snapshot` (`class === 'policy'`). The skill resolves `--signature` and `--parent-group` from the snapshot. **Regression fix:** wallet-cli's `--parent-group` defaults to `Primary`, so policies in non-Primary groups were silently mis-targeted; the resolver now forwards the policy's real parent group. A non-policy id errors with the list of available policy ids; an already-deleted policy id errors "already deleted".
 - `wallet_snapshot` tool description clarified: takes a **profile** address (defaults to configured profile), returns a `safe[]` list; each safe exposes `groups[].nestedObjects[]` keyed by class.
 
 ### Added
