@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **BREAKING — `wallet_tx_delete_user` now takes `{destination, userId}`** instead of `{destination, user, group?}`. `userId` is the user-object id from `wallet_snapshot` (`safe.groups[].nestedObjects[]` where `class === 'user'`), not an `omnistar1…` address. The skill resolves `--signature` and `--parent-group` from the profile snapshot rather than `query profile`. A non-user id errors with the list of available user ids; an already-deleted user id errors "already deleted". Older prompts passing `user`/`group` get a schema-validation error.
+- `wallet_snapshot` tool description clarified: takes a **profile** address (defaults to configured profile), returns a `safe[]` list; each safe exposes `groups[].nestedObjects[]` keyed by class.
+
+### Added
+- `src/snapshotResolver.ts` — snapshot-based resolution (`parseSnapshot`, `findSafe`, `extractGroupsFromSafe`, `resolveCreateUserTarget`, `resolveUserDeletion`, `resolvePolicyDeletion`) with `node:test` coverage, including an end-to-end test against the committed `src/snapshot-fixture.json`.
+
 ## [2.2.0] - 2026-05-18
 
 ### Added
