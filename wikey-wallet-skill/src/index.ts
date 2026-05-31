@@ -1069,7 +1069,7 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
 
 export default {
   name: 'wikey-wallet-skill',
-  version: '2.2.0',
+  version: '3.0.1',
   tools,
   execute,
   systemPrompt: `
@@ -1094,5 +1094,6 @@ wallet_tx_request_recovery: requires the original account's username (wallet-cli
 wallet_tx_edit_policy: policyId and signature come from wallet_profile output (find policy by id field, read its SIGNATURE field).
 wallet_tx_create_user: users are added to a SAFE's groups, NEVER to a profile's groups — \`destination\` must be a safe address (not the agent's own profile). \`user\` must be an \`omnistar1…\` address (usernames are rejected). \`group\` is a group ID (literal \`Primary\` or a UUID from the safe's profile), NEVER a name; omit it when the safe has one group and the skill picks it, or pass an explicit id when ambiguous.
 wallet_tx_delete_user: takes \`{destination, userId}\` — \`userId\` is the user-object id from wallet_snapshot (\`safe.groups[].nestedObjects[]\` where \`class === 'user'\`), NOT an address. The skill resolves \`--signature\` and \`--parent-group\` from the snapshot. A policy id (or any non-user id) errors with the list of available user ids; do not retry with a different tool.
+wallet_tx_delete_user / wallet_tx_delete_policy — A SUCCESSFUL BROADCAST IS NOT A COMPLETED DELETION. These are vote-governed: code 0 only creates a pending deletion request. In a single-member group it auto-applies; in a group with ≥2 users it stays PENDING until the voting threshold is met (the target keeps \`isDeleted:false\` and gets a \`pending_objects[]\` entry with \`applyFunction.functionName === "deleteObject"\`). NEVER report success from the tx code — re-query wallet_snapshot and check the target's \`isDeleted\` flag. If still false with a pending deleteObject, the delete awaits votes: each group member must wallet_tx_vote YES on the pending request's SIGNATURE. Re-broadcasting only stacks duplicate pending requests; do not do it.
   `.trim(),
 };
