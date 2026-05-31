@@ -182,6 +182,20 @@ test('createUser: 2+ groups, no group → ambiguity with id (name) bullets', () 
   assert.match(err!.message, /7f3c-uuid \(Engineering\)/);
 });
 
+test('createUser: ambiguity error excludes soft-deleted groups', () => {
+  const groups = extractGroupsFromSafe(makeSafe());
+  let err: Error | null = null;
+  try {
+    resolveCreateUserTarget({ destination: 'omnistar1safe', groups });
+  } catch (e) {
+    err = e as Error;
+  }
+  assert.ok(err);
+  // 'a9b1-uuid' / 'Archived' is isDeleted:true and must not appear
+  assert.doesNotMatch(err!.message, /a9b1-uuid/);
+  assert.doesNotMatch(err!.message, /Archived/);
+});
+
 test('createUser: group not in safe → throws not-found', () => {
   const groups = extractGroupsFromSafe(makeSafe());
   assert.throws(
