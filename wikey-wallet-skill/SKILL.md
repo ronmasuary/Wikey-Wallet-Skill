@@ -86,6 +86,7 @@ Installs: `signing-server`, `ssp-util` (to `~/.ssp/bin`), and `wallet-cli`
 - Log, write, persist, or transmit the value of `SSP_HMAC_KEY`.
 - Modify, patch, recompile, or replace `wallet-cli` or `ssp-util` in any way (including edits to `node_modules/`, runtime shims, or forked binaries). These are externally-released packages; local changes are invisible to others, get wiped on reinstall, and paper over real problems.
 - **Never use `shell_exec` for any wallet operation** — all wallet operations have dedicated tools. `shell_exec` is not a fallback. Do not pass `hmacKey` to any tool; the skill manages it internally.
+- **Never substitute a different wallet tool to bypass an error.** If a tool fails, quote the error verbatim and ask the user before trying any alternative tool or raw `wallet-cli` invocation. Example anti-pattern: calling `wallet_tx_delete_policy` with a user's id when `wallet_tx_delete_user` errors — this is an unauthorized tool swap, not a workaround. Same for `wallet_tx_delete_user` with a policy id, or any `wallet-cli` shell call outside the dedicated tools.
 
 ### When `wallet-cli` appears broken
 
@@ -95,7 +96,7 @@ Treat the tool as **read-only**. Never edit it to fix a symptom. In order:
 2. **Check inputs.** Wrong address, missing `--broadcast`, wrong asset units (see smallCoin rule), stale `--signature`, `--name` used as a CLI flag instead of stdin, etc.
 3. **Check versions.** Run `wallet-cli --version` and `signing-server --version`. Version drift is a known failure class — report it and stop.
 4. **Check the chain.** RPC reachable? Account funded? Safe validated yet (~30s after broadcast)?
-5. **Stop and report.** Surface the exact command, exact error, and what was already checked — then ask the user.
+5. **Stop and report.** Surface the exact command, exact error, and what was already checked — then ask the user. Do **not** reach for a different tool to route around the failure (see the tool-substitution rule above) — a failing tool is a stop signal, not a prompt to improvise.
 
 ---
 
