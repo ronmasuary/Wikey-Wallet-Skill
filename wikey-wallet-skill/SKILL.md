@@ -567,6 +567,8 @@ wallet-cli tx delete-policy --destination ADDR --policy-id POLICY_ID --signature
 
 The skill (`wallet_tx_delete_policy`) now takes `{destination, policyId}`. Find `policyId` via `wallet_snapshot` under `safe.groups[].nestedObjects[]` where `class === 'policy'` (use the `nestedObject.id`). The skill resolves `--signature` **and** `--parent-group` from the snapshot — `--parent-group` defaults to `Primary` in wallet-cli, so policies in non-Primary groups previously got silently mis-targeted; the resolver now supplies the real group. A user id (or any non-policy id) errors with the list of available policy ids; an already-deleted policy id errors "already deleted".
 
+> A successful broadcast is **not** a completed deletion — same voting semantics as `delete-user`. See the callout under `tx delete-user` below: confirm via `wallet_snapshot` `isDeleted`, and vote if a `deleteObject` request is pending.
+
 ### `tx create-user`
 ```bash
 wallet-cli tx create-user --destination SAFE_ADDR --public-key omnistar1... \
@@ -592,6 +594,15 @@ Same contract as `tx create-user`:
 - `--user-id` and `--signature` are the per-membership id + SIGNATURE.
 
 The skill (`wallet_tx_delete_user`) now takes `{destination, userId}` — **not an address**. Find `userId` via `wallet_snapshot` under `safe.groups[].nestedObjects[]` where `class === 'user'` (use the `nestedObject.id`). The skill resolves `--signature` and `--parent-group` from the snapshot. A policy id (or any non-user id) errors with the list of available user ids; an already-deleted user id errors "already deleted".
+
+> ### ⚠️ A successful broadcast is NOT a completed deletion
+>
+> `delete-user` and `delete-policy` are governed by the group's voting policy. Broadcasting (`code: 0`) only **creates a pending deletion request** attached to the target object — it does **not** flip `isDeleted` on its own.
+>
+> - **Single-member group:** the lone member's vote is auto-applied → the delete takes effect immediately.
+> - **Multi-member group (≥2 users):** the request sits **pending** until the group's voting threshold is met. Until then the target still shows `isDeleted: false`, and a `pending_objects[]` entry with `applyFunction.functionName === "deleteObject"` and `process.currentPhase.name === "In Validation Process"` hangs off the object. Re-broadcasting just **stacks another pending request** — it does not advance the vote.
+>
+> **Always confirm completion by re-querying `wallet_snapshot` and checking the target's `isDeleted` flag** — never infer success from the tx code alone. If it's still `false` with a `deleteObject` pending object, the deletion is awaiting votes: each group member must `wallet_tx_vote` YES on the pending request's `SIGNATURE`, then it executes. Report the pending state honestly; do not claim the user/policy is gone.
 
 > **`add-group` is upstream-pending in wallet-cli** — no skill tool yet.
 
