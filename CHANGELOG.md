@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING — `wallet_tx_delete_policy` now takes `{destination, policyId}`** and no longer accepts a `signature` argument. `policyId` is the policy-object id from `wallet_snapshot` (`class === 'policy'`). The skill resolves `--signature` and `--parent-group` from the snapshot. **Regression fix:** wallet-cli's `--parent-group` defaults to `Primary`, so policies in non-Primary groups were silently mis-targeted; the resolver now forwards the policy's real parent group. A non-policy id errors with the list of available policy ids; an already-deleted policy id errors "already deleted".
 - `wallet_snapshot` tool description clarified: takes a **profile** address (defaults to configured profile), returns a `safe[]` list; each safe exposes `groups[].nestedObjects[]` keyed by class.
 
+- `wallet_tx_create_user` group resolution now reads from the profile snapshot instead of `query profile`. **Behavior change:** soft-deleted groups (`isDeleted: true`) are excluded — they previously appeared in profile output and could be selected. No agent-facing schema change.
+
 ### Added
 - `src/snapshotResolver.ts` — snapshot-based resolution (`parseSnapshot`, `findSafe`, `extractGroupsFromSafe`, `resolveCreateUserTarget`, `resolveUserDeletion`, `resolvePolicyDeletion`) with `node:test` coverage, including an end-to-end test against the committed `src/snapshot-fixture.json`.
 

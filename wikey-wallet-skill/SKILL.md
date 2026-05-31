@@ -574,10 +574,10 @@ wallet-cli tx create-user --destination SAFE_ADDR --public-key omnistar1... \
 
 **Hard contract (skill-side enforcement + agent must understand):**
 - **Users go to a SAFE's groups, NEVER to a profile's groups.** `--destination` must be the safe address — never an agent's profile address.
-- **`--parent-group` is a group ID, not a name.** Valid values: the literal `Primary` (genesis group, id == name), or a UUID from the safe's profile (`query profile --address SAFE_ADDR` → `groups[].id`). Names are rejected by the skill.
+- **`--parent-group` is a group ID, not a name.** Valid values: the literal `Primary` (genesis group, id == name), or a UUID from the safe's snapshot (`wallet_snapshot` → find the safe → `groups[].id`). Names are rejected by the skill.
 - **`--public-key` must be an `omnistar1…` address.** Usernames are rejected by wallet-cli.
 
-The skill (`wallet_tx_create_user`) accepts `{destination, user, group?}` — when `group` is omitted and the safe has exactly one group, the skill passes its id; when ambiguous (≥2 groups), the skill errors with the id (name) pairs so the agent can pick.
+The skill (`wallet_tx_create_user`) accepts `{destination, user, group?}` — when `group` is omitted and the safe has exactly one group, the skill passes its id; when ambiguous (≥2 groups), the skill errors with the id (name) pairs so the agent can pick. Groups are read from the profile snapshot, so soft-deleted groups are excluded.
 
 ### `tx delete-user`
 ```bash

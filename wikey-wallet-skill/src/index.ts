@@ -7,13 +7,10 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 
 import {
-  parseProfile,
-  extractGroupsFromProfile,
-  resolveCreateUserTarget,
-} from './userResolver.js';
-import {
   parseSnapshot,
   findSafe,
+  extractGroupsFromSafe,
+  resolveCreateUserTarget,
   resolveUserDeletion,
   resolvePolicyDeletion,
 } from './snapshotResolver.js';
@@ -999,11 +996,12 @@ async function execute(toolName: string, input: Record<string, unknown>): Promis
       if (!sessionHmacKey) throw new Error('No active SSP session. Call wallet_session_start first.');
       const { destination, user, group } = input as { destination: string; user: string; group?: string };
       if (!user.startsWith('omnistar1')) throw new Error('user must be an omnistar1… address');
-      const profile = parseProfile(await runQuery(['query', 'profile', '--address', destination]));
+      const snapshot = parseSnapshot(await runQuery(['query', 'snapshot']));
+      const safe = findSafe(snapshot, destination);
       const parentGroup = resolveCreateUserTarget({
         destination,
         group,
-        groups: extractGroupsFromProfile(profile),
+        groups: extractGroupsFromSafe(safe),
       });
       return runSigningPrompted(sessionHmacKey, [
         'tx', 'create-user',
