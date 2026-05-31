@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.0.0] - 2026-05-31
 
 ### Changed
 - **BREAKING — `wallet_tx_delete_user` now takes `{destination, userId}`** instead of `{destination, user, group?}`. `userId` is the user-object id from `wallet_snapshot` (`safe.groups[].nestedObjects[]` where `class === 'user'`), not an `omnistar1…` address. The skill resolves `--signature` and `--parent-group` from the profile snapshot rather than `query profile`. A non-user id errors with the list of available user ids; an already-deleted user id errors "already deleted". Older prompts passing `user`/`group` get a schema-validation error.
@@ -14,8 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `wallet_tx_create_user` group resolution now reads from the profile snapshot instead of `query profile`. **Behavior change:** soft-deleted groups (`isDeleted: true`) are excluded — they previously appeared in profile output and could be selected. No agent-facing schema change.
 
+- Operating Rules: explicit prohibition on **tool substitution** — never swap in a different wallet tool (or a raw `wallet-cli` call) to route around a failing tool; quote the error and stop.
+
 ### Added
 - `src/snapshotResolver.ts` — snapshot-based resolution (`parseSnapshot`, `findSafe`, `extractGroupsFromSafe`, `resolveCreateUserTarget`, `resolveUserDeletion`, `resolvePolicyDeletion`) with `node:test` coverage, including an end-to-end test against the committed `src/snapshot-fixture.json`.
+- `src/snapshot-fixture.json` + `src/snapshot-fixture-shape.md` — captured snapshot shape contract guarding against wallet-cli upstream drift.
+
+### Removed
+- `src/userResolver.ts` and `src/userResolver.test.ts` — superseded by `snapshotResolver.ts`; all consumers migrated.
 
 ## [2.2.0] - 2026-05-18
 
