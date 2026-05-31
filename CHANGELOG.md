@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2026-05-31
+
+### Fixed
+- Skill manifest `version` was hardcoded to `2.2.0` in the default export while `package.json` read `3.0.0` — bumped to `3.0.1` and kept in sync.
+
+### Changed
+- `delete-user` / `delete-policy` docs, tool descriptions, and system prompt now state explicitly that **a successful broadcast is not a completed deletion**. These actions are vote-governed: `code: 0` only creates a pending `deleteObject` request. In a single-member group it auto-applies; in a group with ≥2 users it stays pending (target keeps `isDeleted: false`, with a `pending_objects[]` deleteObject entry) until the voting threshold is met. Agents must re-query `wallet_snapshot` and check `isDeleted` rather than inferring success from the tx code, and must not re-broadcast (which only stacks duplicate pending requests).
+
 ## [3.0.0] - 2026-05-31
 
 ### Changed
