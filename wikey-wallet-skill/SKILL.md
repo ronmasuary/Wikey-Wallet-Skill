@@ -47,7 +47,8 @@ Restarting SSP loses the session HMAC key and likely makes the keystore unrecove
 This document is the complete reference for operating the Omnistar blockchain
 via the Secure Signing Process (SSP) in **agent-child mode**: the agent spawns
 SSP, holds the HMAC key in memory, and drives all chain operations exclusively
-through `wallet-cli` and `ssp-util`.
+through `wallet-cli` and `ssp-util`.    
+
 
 ---
 
